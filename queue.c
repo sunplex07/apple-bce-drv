@@ -1,5 +1,6 @@
 #include "queue.h"
 #include "apple_bce.h"
+#include <linux/version.h>
 
 #define REG_DOORBELL_BASE 0x44000
 
@@ -319,7 +320,11 @@ struct bce_queue_cq *bce_create_cq(struct apple_bce_device *dev, u32 el_count)
 {
     struct bce_queue_cq *cq;
     struct bce_queue_memcfg cfg;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
     int qid = ida_simple_get(&dev->queue_ida, BCE_QUEUE_USER_MIN, BCE_QUEUE_USER_MAX, GFP_KERNEL);
+#else
+    int qid = ida_alloc_range(&dev->queue_ida, BCE_QUEUE_USER_MIN, BCE_QUEUE_USER_MAX - 1, GFP_KERNEL);
+#endif
     if (qid < 0)
         return NULL;
     cq = bce_alloc_cq(dev, qid, el_count);
@@ -329,7 +334,11 @@ struct bce_queue_cq *bce_create_cq(struct apple_bce_device *dev, u32 el_count)
     if (bce_cmd_register_queue(dev->cmd_cmdq, &cfg, NULL, false) != 0) {
         pr_err("apple-bce: CQ registration failed (%i)", qid);
         bce_free_cq(dev, cq);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
         ida_simple_remove(&dev->queue_ida, (uint) qid);
+#else
+        ida_free(&dev->queue_ida, (uint) qid);
+#endif
         return NULL;
     }
     dev->queues[qid] = (struct bce_queue *) cq;
@@ -348,7 +357,11 @@ struct bce_queue_sq *bce_create_sq(struct apple_bce_device *dev, struct bce_queu
         return NULL; /* name can not be null */
     if (direction != DMA_TO_DEVICE && direction != DMA_FROM_DEVICE)
         return NULL; /* unsupported direction */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
     qid = ida_simple_get(&dev->queue_ida, BCE_QUEUE_USER_MIN, BCE_QUEUE_USER_MAX, GFP_KERNEL);
+#else
+    qid = ida_alloc_range(&dev->queue_ida, BCE_QUEUE_USER_MIN, BCE_QUEUE_USER_MAX - 1, GFP_KERNEL);
+#endif
     if (qid < 0)
         return NULL;
     sq = bce_alloc_sq(dev, qid, sizeof(struct bce_qe_submission), el_count, compl, userdata);
@@ -358,7 +371,11 @@ struct bce_queue_sq *bce_create_sq(struct apple_bce_device *dev, struct bce_queu
     if (bce_cmd_register_queue(dev->cmd_cmdq, &cfg, name, direction != DMA_FROM_DEVICE) != 0) {
         pr_err("apple-bce: SQ registration failed (%i)", qid);
         bce_free_sq(dev, sq);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
         ida_simple_remove(&dev->queue_ida, (uint) qid);
+#else
+        ida_free(&dev->queue_ida, (uint) qid);
+#endif
         return NULL;
     }
     spin_lock(&dev->queues_lock);
@@ -374,7 +391,11 @@ void bce_destroy_cq(struct apple_bce_device *dev, struct bce_queue_cq *cq)
     spin_lock(&dev->queues_lock);
     dev->queues[cq->qid] = NULL;
     spin_unlock(&dev->queues_lock);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
     ida_simple_remove(&dev->queue_ida, (uint) cq->qid);
+#else
+    ida_free(&dev->queue_ida, (uint) cq->qid);
+#endif
     bce_free_cq(dev, cq);
 }
 
@@ -385,6 +406,10 @@ void bce_destroy_sq(struct apple_bce_device *dev, struct bce_queue_sq *sq)
     spin_lock(&dev->queues_lock);
     dev->queues[sq->qid] = NULL;
     spin_unlock(&dev->queues_lock);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
     ida_simple_remove(&dev->queue_ida, (uint) sq->qid);
+#else
+    ida_free(&dev->queue_ida, (uint) sq->qid);
+#endif
     bce_free_sq(dev, sq);
 }
