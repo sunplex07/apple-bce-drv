@@ -119,10 +119,17 @@ static int bce_vhci_hub_status_data(struct usb_hcd *hcd, char *buf)
     if (!changed)
         return 0;
 
-    /* USB hub status bitmap: bit 0 = hub, bits 1..N = ports 1..N */
-    buf[0] = (changed >> 1) & 0xff;
+    /* USB hub status bitmap: bit 0 = hub, bits 1..N = ports 1..N.
+     * Since we set_bit(port_number, &pending), port N is already
+     * in bit N — matching the USB spec layout directly. */
+    buf[0] = changed & 0xff;
     if (vhci->port_count > 7)
-        buf[1] = (changed >> 9) & 0xff;
+        buf[1] = (changed >> 8) & 0xff;
+    if (vhci->port_count > 15)
+        buf[2] = (changed >> 16) & 0xff;
+
+    if (vhci->port_count > 15)
+        return 3;
     return (vhci->port_count > 7) ? 2 : 1;
 }
 
@@ -684,8 +691,8 @@ static void bce_vhci_handle_system_event(struct bce_vhci_event_queue *q, struct 
         /* Port status change notification from T2 — flag the port and
          * tell the USB framework to re-scan so late-initializing devices
          * (camera, Touch Bar, iBridge) are discovered. */
-        pr_info("bce-vhci: Port %u status change event, requesting hub rescan\n",
-                msg->param1);
+        pr_info_ratelimited("bce-vhci: Port %u status change event, requesting hub rescan\n",
+                            msg->param1);
         set_bit(msg->param1, &q->vhci->port_change_pending);
         usb_hcd_poll_rh_status(q->vhci->hcd);
     } else {
