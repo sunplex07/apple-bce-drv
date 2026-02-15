@@ -686,7 +686,9 @@ static void bce_vhci_handle_system_event(struct bce_vhci_event_queue *q, struct 
 {
     if (msg->cmd & 0x8000) {
         bce_vhci_command_queue_deliver_completion(&q->vhci->cq, msg);
-    } else if (msg->cmd == 0x12 && msg->param1 > 0 && msg->param1 <= q->vhci->port_count) {
+    } else if (msg->cmd == BCE_VHCI_CMD_PORT_STATUS_CHANGE &&
+               msg->param1 > 0 &&
+               msg->param1 <= q->vhci->port_count) {
         /* Port status change notification from T2 — flag the port and
          * tell the USB framework to re-scan so late-initializing devices
          * (camera, Touch Bar, iBridge) are discovered. */
