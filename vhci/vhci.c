@@ -684,6 +684,7 @@ static void bce_vhci_firmware_event_completion(struct bce_queue_sq *sq)
 
 static void bce_vhci_handle_system_event(struct bce_vhci_event_queue *q, struct bce_vhci_message *msg)
 {
+    struct usb_hcd *hcd = q->vhci->hcd;
     if (msg->cmd & 0x8000) {
         bce_vhci_command_queue_deliver_completion(&q->vhci->cq, msg);
     } else if (msg->cmd == BCE_VHCI_CMD_PORT_STATUS_CHANGE &&
@@ -692,10 +693,15 @@ static void bce_vhci_handle_system_event(struct bce_vhci_event_queue *q, struct 
         /* Port status change notification from T2 — flag the port and
          * tell the USB framework to re-scan so late-initializing devices
          * (camera, Touch Bar, iBridge) are discovered. */
-        pr_warn("bce-vhci: Port %u status change event, requesting hub rescan\n",
-                            msg->param1);
-        set_bit(msg->param1, &q->vhci->port_change_pending);
-        usb_hcd_poll_rh_status(q->vhci->hcd);
+        if (hcd) {
+            pr_warn("bce-vhci: Port %u status change event, requesting hub rescan\n",
+                                msg->param1);
+            set_bit(msg->param1, &q->vhci->port_change_pending);
+            usb_hcd_poll_rh_status(hcd);
+        } else {
+            pr_warn("bce-vhci: port %u change received but HCD is NULL\n",
+                                msg->param1);
+        }
     } else {
         pr_warn("bce-vhci: Unhandled system event: %x s=%x p1=%x p2=%llx\n",
                 msg->cmd, msg->status, msg->param1, msg->param2);
