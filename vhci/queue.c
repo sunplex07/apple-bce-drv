@@ -2,6 +2,7 @@
 #include "vhci.h"
 #include "../apple_bce.h"
 
+#define BCE_VHCI_CMD_PORT_RESUME_ID 0x12
 
 static void bce_vhci_message_queue_completion(struct bce_queue_sq *sq);
 
@@ -170,13 +171,103 @@ void bce_vhci_event_queue_resume(struct bce_vhci_event_queue *q)
     bce_vhci_event_queue_submit_pending(q, VHCI_EVENT_PENDING_COUNT);
 }
 
+static bool bce_vhci_completion_matches(struct bce_vhci_message *msg, u16 cmd, u32 param1)
+{
+    u16 rx_cmd = (u16) (msg->cmd & ~0x8000u);
+    return rx_cmd == cmd && msg->param1 == param1;
+}
+
+static void bce_vhci_command_queue_dump_pending_locked(struct bce_vhci_command_queue_completion *c,
+                                                       const char *reason)
+{
+    u16 pos;
+
+    pr_info("bce-vhci: pending dump (%s): count=%u exp=%x/%x waiting=%d\n",
+            reason ? reason : "no reason",
+            c->pending_count, c->expected_cmd, c->expected_param1, c->waiting);
+    for (pos = 0; pos < c->pending_count; pos++) {
+        u16 i = (u16) ((c->pending_head + pos) % VHCI_CMD_PENDING_COUNT);
+        struct bce_vhci_message *m = &c->pending[i];
+        pr_info("bce-vhci: pending[%u] cmd=%x rx=%x st=%x p1=%x p2=%llx\n",
+                pos, m->cmd, (u16) (m->cmd & ~0x8000u), m->status, m->param1,
+                (unsigned long long) m->param2);
+    }
+}
+
+static void bce_vhci_command_queue_clear_pending_locked(struct bce_vhci_command_queue_completion *c,
+                                                        const char *reason)
+{
+    if (c->pending_count)
+        pr_info("bce-vhci: cleared %u pending completions (%s)\n", c->pending_count,
+                reason ? reason : "no reason");
+    c->pending_head = 0;
+    c->pending_count = 0;
+}
+
+void bce_vhci_command_queue_clear_pending(struct bce_vhci_command_queue *cq, const char *reason)
+{
+    spin_lock(&cq->completion_lock);
+    bce_vhci_command_queue_clear_pending_locked(&cq->completion, reason);
+    spin_unlock(&cq->completion_lock);
+}
+
+static void bce_vhci_command_queue_queue_pending(struct bce_vhci_command_queue_completion *c,
+                                                 struct bce_vhci_message *msg)
+{
+    u16 idx;
+    u16 rx_cmd = (u16) (msg->cmd & ~0x8000u);
+
+    if (c->pending_count == VHCI_CMD_PENDING_COUNT) {
+        c->pending_head = (u16) ((c->pending_head + 1) % VHCI_CMD_PENDING_COUNT);
+        c->pending_count--;
+        pr_warn("bce-vhci: pending completion queue full, dropping oldest\n");
+    }
+
+    idx = (u16) ((c->pending_head + c->pending_count) % VHCI_CMD_PENDING_COUNT);
+    c->pending[idx] = *msg;
+    c->pending_count++;
+    pr_warn("bce-vhci: desync exp=%x/%x rx=%x/%x st=%x (queued=%u)\n",
+            c->expected_cmd, c->expected_param1, rx_cmd, msg->param1, msg->status, c->pending_count);
+}
+
+static bool bce_vhci_command_queue_take_pending_match(struct bce_vhci_command_queue_completion *c,
+                                                      u16 expected_cmd, u32 expected_param1,
+                                                      struct bce_vhci_message *res)
+{
+    u16 pos;
+
+    for (pos = 0; pos < c->pending_count; pos++) {
+        u16 i = (u16) ((c->pending_head + pos) % VHCI_CMD_PENDING_COUNT);
+        if (!bce_vhci_completion_matches(&c->pending[i], expected_cmd, expected_param1))
+            continue;
+
+        *res = c->pending[i];
+
+        while (pos + 1 < c->pending_count) {
+            u16 from = (u16) ((c->pending_head + pos + 1) % VHCI_CMD_PENDING_COUNT);
+            u16 to = (u16) ((c->pending_head + pos) % VHCI_CMD_PENDING_COUNT);
+            c->pending[to] = c->pending[from];
+            pos++;
+        }
+        c->pending_count--;
+        return true;
+    }
+    return false;
+}
+
 void bce_vhci_command_queue_create(struct bce_vhci_command_queue *ret, struct bce_vhci_message_queue *mq)
 {
     ret->mq = mq;
     ret->completion.result = NULL;
+    ret->completion.expected_cmd = 0;
+    ret->completion.expected_param1 = 0;
+    ret->completion.waiting = false;
+    ret->completion.pending_head = 0;
+    ret->completion.pending_count = 0;
     init_completion(&ret->completion.completion);
     spin_lock_init(&ret->completion_lock);
     mutex_init(&ret->mutex);
+    pr_info("bce-vhci: command completion demux enabled (cmd+param1)\n");
 }
 
 void bce_vhci_command_queue_destroy(struct bce_vhci_command_queue *cq)
@@ -187,7 +278,9 @@ void bce_vhci_command_queue_destroy(struct bce_vhci_command_queue *cq)
         cq->completion.result->status = BCE_VHCI_ABORT;
         complete(&cq->completion.completion);
         cq->completion.result = NULL;
+        cq->completion.waiting = false;
     }
+    bce_vhci_command_queue_clear_pending_locked(&cq->completion, "command queue destroy");
     spin_unlock(&cq->completion_lock);
     mutex_lock(&cq->mutex);
     mutex_unlock(&cq->mutex);
@@ -197,12 +290,25 @@ void bce_vhci_command_queue_destroy(struct bce_vhci_command_queue *cq)
 void bce_vhci_command_queue_deliver_completion(struct bce_vhci_command_queue *cq, struct bce_vhci_message *msg)
 {
     struct bce_vhci_command_queue_completion *c = &cq->completion;
+    u16 rx_cmd = (u16) (msg->cmd & ~0x8000u);
 
     spin_lock(&cq->completion_lock);
-    if (c->result) {
-        *c->result = *msg;
-        complete(&c->completion);
-        c->result = NULL;
+    if (rx_cmd == BCE_VHCI_CMD_PORT_RESUME_ID) {
+        pr_info("bce-vhci: cq rx PORT_RESUME completion cmd=%x st=%x p1=%x p2=%llx waiting=%d exp=%x/%x pending=%u\n",
+                msg->cmd, msg->status, msg->param1, (unsigned long long) msg->param2,
+                c->waiting, c->expected_cmd, c->expected_param1, c->pending_count);
+    }
+    if (c->result && c->waiting) {
+        if (bce_vhci_completion_matches(msg, c->expected_cmd, c->expected_param1)) {
+            *c->result = *msg;
+            complete(&c->completion);
+            c->result = NULL;
+            c->waiting = false;
+        } else {
+            bce_vhci_command_queue_queue_pending(c, msg);
+        }
+    } else {
+        bce_vhci_command_queue_queue_pending(c, msg);
     }
     spin_unlock(&cq->completion_lock);
 }
@@ -211,8 +317,8 @@ static int __bce_vhci_command_queue_execute(struct bce_vhci_command_queue *cq, s
         struct bce_vhci_message *res, unsigned long timeout)
 {
     int status;
+    bool trace_port_resume = req->cmd == BCE_VHCI_CMD_PORT_RESUME_ID;
     struct bce_vhci_command_queue_completion *c;
-    struct bce_vhci_message creq;
     c = &cq->completion;
 
     if ((status = bce_reserve_submission(cq->mq->sq, &timeout)))
@@ -220,38 +326,83 @@ static int __bce_vhci_command_queue_execute(struct bce_vhci_command_queue *cq, s
 
     spin_lock(&cq->completion_lock);
     c->result = res;
+    c->expected_cmd = req->cmd;
+    c->expected_param1 = req->param1;
+    c->waiting = true;
     reinit_completion(&c->completion);
+    if (trace_port_resume) {
+        pr_info("bce-vhci: cq send PORT_RESUME req(cmd=%x p1=%x p2=%llx) exp=%x/%x pending_before=%u\n",
+                req->cmd, req->param1, (unsigned long long) req->param2,
+                c->expected_cmd, c->expected_param1, c->pending_count);
+        if (req->param1 == 6 && c->pending_count)
+            bce_vhci_command_queue_dump_pending_locked(c, "before send port6");
+    }
     spin_unlock(&cq->completion_lock);
 
     bce_vhci_message_queue_write(cq->mq, req);
 
-    if (!wait_for_completion_timeout(&c->completion, timeout)) {
-        /* we ran out of time, send cancellation */
-        pr_debug("bce-vhci: command timed out req=%x\n", req->cmd);
-        if ((status = bce_reserve_submission(cq->mq->sq, &timeout)))
-            return status;
-
-        creq = *req;
-        creq.cmd |= 0x4000;
-        bce_vhci_message_queue_write(cq->mq, &creq);
-
-        if (!wait_for_completion_timeout(&c->completion, 1000)) {
-            pr_err("bce-vhci: Possible desync, cmd cancel timed out\n");
-
-            spin_lock(&cq->completion_lock);
-            c->result = NULL;
-            spin_unlock(&cq->completion_lock);
-            return -ETIMEDOUT;
+    spin_lock(&cq->completion_lock);
+    if (trace_port_resume && req->param1 == 6 && c->waiting && c->result) {
+        pr_info("bce-vhci: cq waiting for PORT_RESUME p1=6 reply (pending=%u)\n",
+                c->pending_count);
+        if (c->pending_count)
+            bce_vhci_command_queue_dump_pending_locked(c, "waiting port6");
+    }
+    if (c->waiting && c->result &&
+        bce_vhci_command_queue_take_pending_match(c, c->expected_cmd, c->expected_param1, c->result)) {
+        if (trace_port_resume) {
+            pr_info("bce-vhci: cq PORT_RESUME p1=%x satisfied from pending res(cmd=%x st=%x p1=%x p2=%llx)\n",
+                    req->param1, c->result->cmd, c->result->status, c->result->param1,
+                    (unsigned long long) c->result->param2);
         }
-        if ((res->cmd & ~0x8000) == creq.cmd)
-            return -ETIMEDOUT;
-        /* reply for the previous command most likely arrived */
+        c->result = NULL;
+        c->waiting = false;
+        spin_unlock(&cq->completion_lock);
+        goto got_reply;
+    }
+    spin_unlock(&cq->completion_lock);
+
+    if (!wait_for_completion_timeout(&c->completion, timeout)) {
+        pr_err("bce-vhci: command timeout cmd=%x p1=%x (waited %lu jiffies)\n",
+               req->cmd, req->param1, timeout);
+        bce_vhci_dump_recent_system_events(
+                container_of(cq, struct bce_vhci, cq), req);
+
+        /* Send cancel command to keep T2 state consistent */
+        spin_lock(&cq->completion_lock);
+        c->result = res;   /* reuse res for cancel response */
+        c->expected_cmd = req->cmd | 0x4000;
+        c->expected_param1 = req->param1;
+        reinit_completion(&c->completion);
+        spin_unlock(&cq->completion_lock);
+
+        if (!bce_reserve_submission(cq->mq->sq, NULL)) {
+            struct bce_vhci_message creq = *req;
+            creq.cmd |= 0x4000;
+            bce_vhci_message_queue_write(cq->mq, &creq);
+
+            if (!wait_for_completion_timeout(&c->completion,
+                                             msecs_to_jiffies(1000))) {
+                pr_err("bce-vhci: cmd cancel timed out, possible desync\n");
+            }
+        }
+
+        spin_lock(&cq->completion_lock);
+        c->result = NULL;
+        c->waiting = false;
+        spin_unlock(&cq->completion_lock);
+        return -ETIMEDOUT;
+    }
+    if (trace_port_resume) {
+        pr_info("bce-vhci: cq PORT_RESUME p1=%x completed res(cmd=%x st=%x p1=%x p2=%llx)\n",
+                req->param1, res->cmd, res->status, res->param1, (unsigned long long) res->param2);
     }
 
-    if ((res->cmd & ~0x8000) != req->cmd) {
-        pr_err("bce-vhci: Possible desync, cmd reply mismatch req=%x, res=%x\n", req->cmd, res->cmd);
-        return -EIO;
-    }
+got_reply:
+    /* command queue shutdown path */
+    if (res->status == BCE_VHCI_ABORT)
+        return BCE_VHCI_ABORT;
+
     if (res->status == BCE_VHCI_SUCCESS)
         return 0;
     return res->status;

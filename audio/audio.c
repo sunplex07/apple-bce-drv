@@ -2,6 +2,7 @@
 #include <linux/spinlock.h>
 #include <linux/module.h>
 #include <linux/random.h>
+#include <linux/workqueue.h>
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
@@ -13,6 +14,15 @@
 static int aaudio_alsa_index = SNDRV_DEFAULT_IDX1;
 static char *aaudio_alsa_id = SNDRV_DEFAULT_STR1;
 
+/*
+ * GPR sentinel register offset (byte offset from GPR base).
+ * macOS BridgeAudioControllerPCI writes 0x19770525 here on sleep and
+ * checks it on wake. If the sentinel is gone, the T2 bridge rebooted
+ * during sleep and the driver must re-map remote memory.
+ */
+#define AAUDIO_GPR_SLEEP_SENTINEL_IDX  (0x9AE0 / 4)
+#define AAUDIO_GPR_SLEEP_SENTINEL_VAL  0x19770525
+
 static dev_t aaudio_chrdev;
 static struct class *aaudio_class;
 
@@ -20,6 +30,85 @@ static int aaudio_init_cmd(struct aaudio_device *a);
 static int aaudio_init_bs(struct aaudio_device *a);
 static void aaudio_init_dev(struct aaudio_device *a, aaudio_device_id_t dev_id);
 static void aaudio_free_dev(struct aaudio_subdevice *sdev);
+static void aaudio_resume_work(struct work_struct *ws);
+static void aaudio_handle_jack_connection_change(struct aaudio_subdevice *sdev);
+
+static void aaudio_resume_work(struct work_struct *ws)
+{
+    struct aaudio_device *a = container_of(ws, struct aaudio_device, resume_work);
+    u32 ver, sig;
+    struct aaudio_subdevice *sdev;
+    struct aaudio_send_ctx sctx;
+
+    dev_info(a->dev, "aaudio: deferred resume starting\n");
+
+    /*
+     * Validate GPR magic.
+     * BridgeAudioPCI::initWithBaseAddresses checks version >= 3 and
+     * signature == 0x19870423.
+     */
+
+    ver = ioread32(&a->reg_mem_gpr[0]);
+    sig = ioread32(&a->reg_mem_gpr[1]);
+    if (ver < 3 || sig != AAUDIO_SIG) {
+        dev_err(a->dev, "aaudio: GPR validation failed (ver=%u, sig=0x%x)\n", ver, sig);
+        goto out;
+    }
+
+    /*
+     * re-handshake with T2. send alive notification and wait for remote alive response.
+     * same init sequence in aaudio_init_cmd().
+     */
+    reinit_completion(&a->remote_alive);
+    if (aaudio_send(a, &sctx, 500, aaudio_msg_write_alive_notification, 1, 3)) {
+        dev_err(a->dev, "aaudio: resume alive notification send failed\n");
+        goto out;
+    }
+
+    if (wait_for_completion_timeout(&a->remote_alive, msecs_to_jiffies(500)) == 0) {
+        dev_warn(a->dev, "aaudio: resume alive response timed out\n");
+        /* Continue anyway — T2 may still process our commands */
+    }
+
+    /*
+     * tell the T2 we want DMA access to audio buffers again.
+     */
+    if (aaudio_cmd_set_remote_access_timeout(a, AAUDIO_REMOTE_ACCESS_ON, 500)) {
+        dev_err(a->dev, "aaudio: resume SET_REMOTE_ACCESS(ON) failed\n");
+        goto out;
+    }
+
+    /*
+     * re-register input stream address range: DMA coherent buffers allocated during
+     * probe survive suspend (since physical addr doesnt change), just have to tell
+     * the T2 about them again.
+     */
+    list_for_each_entry(sdev, &a->subdevice_list, list) {
+        if (sdev->in_stream_cnt == 1 && sdev->buf_id != AAUDIO_BUFFER_ID_NONE) {
+            if (aaudio_cmd_set_input_stream_address_ranges(a, sdev->dev_id))
+                dev_warn(a->dev, "aaudio: resume re-register input ranges for %s failed\n",
+                         sdev->uid);
+        }
+    }
+
+    /*
+     * re-register property listeners (e.g jack plug status).
+     */
+    list_for_each_entry(sdev, &a->subdevice_list, list) {
+        if (sdev->jack) {
+            aaudio_cmd_property_listener(a, sdev->dev_id, sdev->dev_id,
+                    AAUDIO_PROP(AAUDIO_PROP_SCOPE_OUTPUT, AAUDIO_PROP_JACK_PLUGGED, 0));
+            aaudio_handle_jack_connection_change(sdev);
+        }
+    }
+
+    a->alive = true;
+    dev_info(a->dev, "aaudio: deferred resume complete\n");
+    return;
+
+out:
+    dev_err(a->dev, "aaudio: deferred resume failed, audio may not work\n");
+}
 
 static int aaudio_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
@@ -60,12 +149,15 @@ static int aaudio_probe(struct pci_dev *dev, const struct pci_device_id *id)
         status = PTR_ERR(aaudio_class);
         goto fail;
     }
-    device_link_add(aaudio->dev, aaudio->bce->dev, DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_CONSUMER);
+    device_link_add(&aaudio->pci->dev, &aaudio->bce->pci->dev,
+            DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_CONSUMER);
 
     init_completion(&aaudio->remote_alive);
+    INIT_WORK(&aaudio->resume_work, aaudio_resume_work);
+    aaudio->alive = true;
     INIT_LIST_HEAD(&aaudio->subdevice_list);
 
-    /* Init: set an unknown flag in the bitset */
+
     if (pci_read_config_dword(dev, 4, &cfg))
         dev_warn(&dev->dev, "aaudio: pci_read_config_dword fail\n");
     if (pci_write_config_dword(dev, 4, cfg | 6u))
@@ -96,7 +188,7 @@ static int aaudio_probe(struct pci_dev *dev, const struct pci_device_id *id)
     strcpy(aaudio->card->shortname, "Apple T2 Audio");
     strcpy(aaudio->card->longname, "Apple T2 Audio");
     strcpy(aaudio->card->mixername, "Apple T2 Audio");
-    /* Dynamic alsa ids start at 100 */
+    /* dynamic alsa ids start at 100 */
     aaudio->next_alsa_id = 100;
 
     if (aaudio_init_cmd(aaudio)) {
@@ -158,6 +250,8 @@ static void aaudio_remove(struct pci_dev *dev)
     struct aaudio_subdevice *sdev;
     struct aaudio_device *aaudio = pci_get_drvdata(dev);
 
+    cancel_work_sync(&aaudio->resume_work);
+    aaudio->alive = false;
     snd_card_free(aaudio->card);
     while (!list_empty(&aaudio->subdevice_list)) {
         sdev = list_first_entry(&aaudio->subdevice_list, struct aaudio_subdevice, list);
@@ -177,9 +271,17 @@ static int aaudio_suspend(struct device *dev)
 {
     struct aaudio_device *aaudio = pci_get_drvdata(to_pci_dev(dev));
 
-    if (aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_OFF))
-        dev_warn(aaudio->dev, "Failed to reset remote access\n");
+    /* cancel any pending resume work before sleep */
+    cancel_work_sync(&aaudio->resume_work);
 
+    aaudio->alive = false;
+
+    /*
+     * macOS BridgeAudioControllerPCI::_setPowerStateGated(0) only sets
+     * _isSleeping = true and writes a sentinel.  it doesn't send any T2 commands
+     * no SET_REMOTE_ACCESS or stream stops. BCE core handles T2 power transition
+     * so all we have to do is set flags and disable PCI
+     */
     pci_disable_device(aaudio->pci);
     return 0;
 }
@@ -193,11 +295,19 @@ static int aaudio_resume(struct device *dev)
         return status;
     pci_set_master(aaudio->pci);
 
-    if ((status = aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_ON))) {
-        dev_err(aaudio->dev, "Failed to set remote access\n");
-        return status;
-    }
-
+    /*
+     * just-renable PCI and schedule deferred reinit.
+     * ref: macOS BridgeAudioController::_setPowerStateGated(1) only
+     * clears the __isSleeping flag and doesn't use T2 cmds.
+     *
+     * NOTE: linux ALSA doesn't have a good lazy-init path, so:
+     * - check sleep sentinel , for bridge power failure
+     * - validate GPR magic (0x19870423)
+     * - send alive notif + wait for remote
+     * - re-enable remote access
+     * - re-register input stream addr ranges & property listeners
+     */
+    schedule_work(&aaudio->resume_work);
     return 0;
 }
 
@@ -272,10 +382,10 @@ static void aaudio_init_dev(struct aaudio_device *a, aaudio_device_id_t dev_id)
         dev_err(a->dev, "Failed to get input stream list for device %llx\n", dev_id);
         goto fail;
     }
-    if (stream_cnt > AAUDIO_DEVICE_MAX_INPUT_STREAMS) {
+    if (stream_cnt > AAUDIO_DEIVCE_MAX_INPUT_STREAMS) {
         dev_warn(a->dev, "Device %s input stream count %llu is larger than the supported count of %u\n",
-                sdev->uid, stream_cnt, AAUDIO_DEVICE_MAX_INPUT_STREAMS);
-        stream_cnt = AAUDIO_DEVICE_MAX_INPUT_STREAMS;
+                sdev->uid, stream_cnt, AAUDIO_DEIVCE_MAX_INPUT_STREAMS);
+        stream_cnt = AAUDIO_DEIVCE_MAX_INPUT_STREAMS;
     }
     sdev->in_stream_cnt = stream_cnt;
     for (i = 0; i < stream_cnt; i++) {
@@ -289,17 +399,17 @@ static void aaudio_init_dev(struct aaudio_device *a, aaudio_device_id_t dev_id)
         dev_err(a->dev, "Failed to get output stream list for device %llx\n", dev_id);
         goto fail;
     }
-    if (stream_cnt > AAUDIO_DEVICE_MAX_OUTPUT_STREAMS) {
-        dev_warn(a->dev, "Device %s output stream count %llu is larger than the supported count of %u\n",
-                 sdev->uid, stream_cnt, AAUDIO_DEVICE_MAX_OUTPUT_STREAMS);
-        stream_cnt = AAUDIO_DEVICE_MAX_OUTPUT_STREAMS;
+    if (stream_cnt > AAUDIO_DEIVCE_MAX_OUTPUT_STREAMS) {
+        dev_warn(a->dev, "Device %s input stream count %llu is larger than the supported count of %u\n",
+                 sdev->uid, stream_cnt, AAUDIO_DEIVCE_MAX_OUTPUT_STREAMS);
+        stream_cnt = AAUDIO_DEIVCE_MAX_OUTPUT_STREAMS;
     }
     sdev->out_stream_cnt = stream_cnt;
     for (i = 0; i < stream_cnt; i++) {
         sdev->out_streams[i].id = stream_list[i];
         sdev->out_streams[i].buffer_cnt = 0;
         aaudio_init_stream_info(sdev, &sdev->out_streams[i]);
-        sdev->out_streams[i].latency += sdev->out_latency;
+        sdev->out_streams[i].latency += sdev->in_latency;
     }
 
     if (sdev->is_pcm)
@@ -454,10 +564,10 @@ static void aaudio_init_bs_stream(struct aaudio_device *a, struct aaudio_stream 
 {
     size_t i;
     strm->buffer_cnt = bs_strm->num_buffers;
-    if (bs_strm->num_buffers > AAUDIO_DEVICE_MAX_BUFFER_COUNT) {
+    if (bs_strm->num_buffers > AAUDIO_DEIVCE_MAX_BUFFER_COUNT) {
         dev_warn(a->dev, "BufferStruct buffer count %u exceeds driver limit of %u\n", bs_strm->num_buffers,
-                AAUDIO_DEVICE_MAX_BUFFER_COUNT);
-        strm->buffer_cnt = AAUDIO_DEVICE_MAX_BUFFER_COUNT;
+                AAUDIO_DEIVCE_MAX_BUFFER_COUNT);
+        strm->buffer_cnt = AAUDIO_DEIVCE_MAX_BUFFER_COUNT;
     }
     if (!strm->buffer_cnt)
         return;
@@ -528,7 +638,7 @@ void aaudio_handle_notification(struct aaudio_device *a, struct aaudio_msg *msg)
         case AAUDIO_MSG_NOTIFICATION_BOOT:
             dev_info(a->dev, "Received boot notification from remote\n");
 
-            /* Resend the alive notify */
+            /* resend the alive notify */
             if (aaudio_send(a, &sctx, 500,
                     aaudio_msg_write_alive_notification, 1, 3)) {
                 pr_err("Sending alive notification failed\n");

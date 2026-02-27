@@ -139,6 +139,7 @@ int aaudio_cmd_get_input_stream_list(struct aaudio_device *a, struct aaudio_msg 
 int aaudio_cmd_get_output_stream_list(struct aaudio_device *a, struct aaudio_msg *buf, aaudio_device_id_t devid,
         aaudio_object_id_t **str_l, u64 *str_cnt);
 int aaudio_cmd_set_remote_access(struct aaudio_device *a, u64 mode);
+int aaudio_cmd_set_remote_access_timeout(struct aaudio_device *a, u64 mode, unsigned int timeout_ms);
 int aaudio_cmd_get_device_list(struct aaudio_device *a, struct aaudio_msg *buf,
         aaudio_device_id_t **dev_l, u64 *dev_cnt);
 

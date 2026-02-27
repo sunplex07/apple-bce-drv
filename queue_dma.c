@@ -153,6 +153,7 @@ static struct bce_segment_list_element_hostinfo *bce_map_segment_list(
         el->addr = sg->dma_address;
         el->length = sg->length;
         header->data_size += el->length;
+        ++el;
     }
 
     /* DMA map */

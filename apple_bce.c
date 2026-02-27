@@ -1,6 +1,7 @@
 #include "apple_bce.h"
 #include <linux/module.h>
 #include <linux/crc32.h>
+#include <linux/pm_runtime.h>
 #include "audio/audio.h"
 #include <linux/version.h>
 
@@ -31,6 +32,14 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
         goto fail;
     }
     pci_set_master(dev);
+
+    /*
+     * IMPORTANT: The t2 handles it's own PM, through pup mailbox, avoid the PCI subsystem
+     * from transitioning the device
+     */
+    pm_runtime_forbid(&dev->dev);
+    dev->d3cold_allowed = false;
+
     nvec = pci_alloc_irq_vectors(dev, 1, 8, PCI_IRQ_MSI);
     if (nvec < 5) {
         status = -EINVAL;
@@ -346,10 +355,31 @@ static int apple_bce_suspend(struct device *dev)
 
     bce_timestamp_stop(&bce->timestamp);
 
-    if ((status = bce_save_state_and_sleep(bce)))
+    if ((status = bce_save_state_and_sleep(bce))) {
+        bce_timestamp_start(&bce->timestamp, false);
         return status;
+    }
 
     return 0;
+}
+
+static int bce_wait_for_link(struct apple_bce_device *bce)
+{
+    u16 vid;
+    int i;
+
+    for (i = 0; i < 120; i++) {
+        pci_read_config_word(bce->pci, PCI_VENDOR_ID, &vid);
+        if (vid == PCI_VENDOR_ID_APPLE)
+            return 0;
+        if (i < 40)
+            usleep_range(5000, 6000);
+        else
+            msleep(50);
+    }
+
+    pr_err("apple-bce: resume: T2 not accessible after link retrain timeout (vid=0x%04x)\n", vid);
+    return -ENODEV;
 }
 
 static int apple_bce_resume(struct device *dev)
@@ -357,9 +387,27 @@ static int apple_bce_resume(struct device *dev)
     struct apple_bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
     int status;
 
+    status = bce_wait_for_link(bce);
+    if (status) {
+        pr_err("apple-bce: resume: link retrain failed, aborting\n");
+        return status;
+    }
+
     pci_set_master(bce->pci);
     pci_set_master(bce->pci0);
 
+    /*
+     * macOS wake ordering (verified from x86 disassembly of
+     * IOBufferCopyController::sendWakeMessage @ 0xffffff8002a5f3b6):
+     *   1. super::sendWakeMessage() → PUP 0x1B mailbox, wait for 0x1A ACK
+     *   2. writeRegister32(0xFFFFFFFD, 0xC008) → wake doorbell
+     *   3. writeRegister32(0xFFFFFFFF, 0xC000) → strobe
+     *   4. engine->reconfigure() → DMA reconfigure
+     *
+     * bce_timestamp_start(false) after the mailbox call performs step 2-3.
+     * Do NOT write the doorbell before the mailbox — the T2 must receive
+     * PUP 0x1B while still in "waiting for wake command" state.
+     */
     if ((status = bce_restore_state_and_wake(bce)))
         return status;
 

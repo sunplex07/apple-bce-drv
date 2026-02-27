@@ -1,6 +1,7 @@
 #include "vhci.h"
 #include "../apple_bce.h"
 #include "command.h"
+#include <linux/device.h>
 #include <linux/usb.h>
 #include <linux/usb/hcd.h>
 #include <linux/module.h>
@@ -17,12 +18,54 @@ static int bce_vhci_create_message_queues(struct bce_vhci *vhci);
 static void bce_vhci_destroy_message_queues(struct bce_vhci *vhci);
 static void bce_vhci_handle_firmware_events_w(struct work_struct *ws);
 static void bce_vhci_firmware_event_completion(struct bce_queue_sq *sq);
+static void bce_vhci_port_change_work(struct work_struct *ws);
+static void bce_vhci_dfr_reset_work(struct work_struct *ws);
+static void bce_vhci_record_system_event(struct bce_vhci *vhci, const struct bce_vhci_message *msg);
+
+static void bce_vhci_record_system_event(struct bce_vhci *vhci, const struct bce_vhci_message *msg)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&vhci->sys_event_log_lock, flags);
+    vhci->sys_event_log[vhci->sys_event_log_head] = *msg;
+    vhci->sys_event_log_head = (vhci->sys_event_log_head + 1) % BCE_VHCI_SYS_EVENT_LOG_SIZE;
+    if (vhci->sys_event_log_count < BCE_VHCI_SYS_EVENT_LOG_SIZE)
+        vhci->sys_event_log_count++;
+    spin_unlock_irqrestore(&vhci->sys_event_log_lock, flags);
+}
+
+void bce_vhci_dump_recent_system_events(struct bce_vhci *vhci, const struct bce_vhci_message *req)
+{
+    unsigned long flags;
+    struct bce_vhci_message snapshot[BCE_VHCI_SYS_EVENT_LOG_SIZE];
+    u32 i, count, head;
+
+    spin_lock_irqsave(&vhci->sys_event_log_lock, flags);
+    count = vhci->sys_event_log_count;
+    head = vhci->sys_event_log_head;
+    for (i = 0; i < count; i++) {
+        u32 idx = (head + BCE_VHCI_SYS_EVENT_LOG_SIZE - count + i) % BCE_VHCI_SYS_EVENT_LOG_SIZE;
+        snapshot[i] = vhci->sys_event_log[idx];
+    }
+    spin_unlock_irqrestore(&vhci->sys_event_log_lock, flags);
+
+    pr_err("bce-vhci: recent system events before timeout req=%x p1=%x p2=%llx count=%u\n",
+           req->cmd, req->param1, req->param2, count);
+    for (i = 0; i < count; i++) {
+        struct bce_vhci_message *m = &snapshot[i];
+        pr_err("bce-vhci:   sys_ev[%u] cmd=%x st=%x p1=%x p2=%llx\n",
+               i, m->cmd, m->status, m->param1, m->param2);
+    }
+}
 
 int bce_vhci_create(struct apple_bce_device *dev, struct bce_vhci *vhci)
 {
     int status;
 
     spin_lock_init(&vhci->hcd_spinlock);
+    spin_lock_init(&vhci->sys_event_log_lock);
+    vhci->sys_event_log_head = 0;
+    vhci->sys_event_log_count = 0;
 
     vhci->dev = dev;
 
@@ -40,6 +83,10 @@ int bce_vhci_create(struct apple_bce_device *dev, struct bce_vhci *vhci)
 
     vhci->tq_state_wq = alloc_ordered_workqueue("bce-vhci-tq-state", 0);
     INIT_WORK(&vhci->w_fw_events, bce_vhci_handle_firmware_events_w);
+    INIT_WORK(&vhci->w_port_change, bce_vhci_port_change_work);
+    INIT_DELAYED_WORK(&vhci->w_dfr_reset, bce_vhci_dfr_reset_work);
+    vhci->dfr_reset_udev = NULL;
+    vhci->dfr_needs_boot_reset = true;
 
     vhci->hcd = usb_create_hcd(&bce_vhci_driver, vhci->vdev, "bce-vhci");
     if (!vhci->hcd) {
@@ -72,6 +119,12 @@ fail_dev:
 
 void bce_vhci_destroy(struct bce_vhci *vhci)
 {
+    cancel_delayed_work_sync(&vhci->w_dfr_reset);
+    if (vhci->dfr_reset_udev) {
+        usb_put_dev(vhci->dfr_reset_udev);
+        vhci->dfr_reset_udev = NULL;
+    }
+    cancel_work_sync(&vhci->w_port_change);
     usb_remove_hcd(vhci->hcd);
     bce_vhci_destroy_event_queues(vhci);
     bce_vhci_destroy_message_queues(vhci);
@@ -119,10 +172,6 @@ static int bce_vhci_hub_status_data(struct usb_hcd *hcd, char *buf)
     changed = xchg(&vhci->port_change_pending, 0);
     if (!changed)
         return 0;
-
-    /* USB hub status bitmap: bit 0 = hub, bits 1..N = ports 1..N.
-     * Since we set_bit(port_number, &pending), port N is already
-     * in bit N — matching the USB spec layout directly. */
 
     bytes = DIV_ROUND_UP(vhci->port_count + 1, 8);
 
@@ -282,9 +331,16 @@ static void bce_vhci_free_device(struct usb_hcd *hcd, struct usb_device *udev)
         if (dev->tq_mask & BIT(i)) {
             bce_vhci_transfer_queue_pause(&dev->tq[i], BCE_VHCI_PAUSE_SHUTDOWN);
             bce_vhci_cmd_endpoint_destroy(&vhci->cq, devid, (u8) i);
+            /*
+             * for suspend/resume, hcpriv should be cleared BEFORE the queue gets destroyed.
+             * fixes UAF if URB ops occur during teardown
+             */
+            if (dev->tq[i].endp)
+                dev->tq[i].endp->hcpriv = NULL;
             bce_vhci_destroy_transfer_queue(vhci, &dev->tq[i]);
         }
     }
+    dev->tq_mask = 0; /* ok, all queues as freed */
     vhci->devices[devid] = NULL;
     vhci->port_to_device[udev->portnum] = 0;
     bce_vhci_cmd_device_destroy(&vhci->cq, devid);
@@ -308,6 +364,11 @@ static int bce_vhci_reset_device(struct bce_vhci *vhci, int index, u16 timeout)
             if (dev->tq_mask & BIT(i)) {
                 bce_vhci_transfer_queue_pause(&dev->tq[i], BCE_VHCI_PAUSE_SHUTDOWN);
                 bce_vhci_cmd_endpoint_destroy(&vhci->cq, devid, (u8) i);
+                /*
+                 * suspend resume fix: avoid UAF, similar case as above.
+                 */
+                if (dev->tq[i].endp)
+                    dev->tq[i].endp->hcpriv = NULL;
                 bce_vhci_destroy_transfer_queue(vhci, &dev->tq[i]);
             }
         }
@@ -329,6 +390,8 @@ static int bce_vhci_reset_device(struct bce_vhci *vhci, int index, u16 timeout)
                 if (i == 0)
                     dir = DMA_BIDIRECTIONAL;
                 bce_vhci_create_transfer_queue(vhci, &dev->tq[i], dev->tq[i].endp, devid, dir);
+                /* restore hcpriv after recreating the queue */
+                dev->tq[i].endp->hcpriv = &dev->tq[i];
                 bce_vhci_cmd_endpoint_create(&vhci->cq, devid, &dev->tq[i].endp->desc);
             }
         }
@@ -339,6 +402,50 @@ static int bce_vhci_reset_device(struct bce_vhci *vhci, int index, u16 timeout)
 
 static int bce_vhci_check_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
 {
+    struct bce_vhci *vhci = bce_vhci_from_hcd(hcd);
+    bce_vhci_device_t devid;
+    struct bce_vhci_device *vdev;
+
+    if (udev->bus->root_hub == udev)
+        return 0;
+
+    devid = vhci->port_to_device[udev->portnum];
+    if (!devid)
+        return 0;
+    vdev = vhci->devices[devid];
+    if (!vdev)
+        return 0;
+
+    /*
+     * this is NEEDED to fix DFR endpoint activation.
+     * This is needed because the DFR subsystem only activates its bulk endpoints
+     * when they exist on DEVICE_CREATE . during the first enumeraton the endpoints
+     * are created incrementally
+     *
+     * ep0 first > then the ones that follow through add-endpoint on usb_set_configuration).
+     * the DFR subsystem ignores these "late" endpoints so the bulk transfers time out.
+     *
+     * to fix this, a deferred direct T2-side reset is scheulded on cold boot.
+     * bce_vhci_reset_device() destroys and re-creates ALL endpoints in a single batch after DEVICE_CREATE,
+     * and actives the DFR subsystem. however, it's NOT needed after suspend/resume because the T2 fw happens to remember the DFR state
+     * across suspend cycles, so re-enumeration works completely. Reset should NOT be done on resume, because it causes command queue desync
+     * and messes up the other devices.
+     *
+     * the 3-s delay is to make sure all other USB devices finished enumerating before we touch the T2 queues.
+     *
+     */
+    if (vhci->dfr_needs_boot_reset && (vdev->tq_mask & ~BIT(0)) &&
+        le16_to_cpu(udev->descriptor.idVendor) == 0x05AC &&
+        le16_to_cpu(udev->descriptor.idProduct) == 0x8302) {
+        vhci->dfr_needs_boot_reset = false;
+        if (!vhci->dfr_reset_udev) {
+            pr_info("bce-vhci: port %d Touch Bar DFR detected, scheduling deferred reset\n",
+                    udev->portnum);
+            vhci->dfr_reset_udev = usb_get_dev(udev);
+            schedule_delayed_work(&vhci->w_dfr_reset, msecs_to_jiffies(3000));
+        }
+    }
+
     return 0;
 }
 
@@ -358,11 +465,14 @@ static int bce_vhci_bus_suspend(struct usb_hcd *hcd)
     for (i = 0; i < 16; i++) {
         if (!vhci->port_to_device[i])
             continue;
+        if (!vhci->devices[vhci->port_to_device[i]])
+            continue;
         for (j = 0; j < 32; j++) {
             if (!(vhci->devices[vhci->port_to_device[i]]->tq_mask & BIT(j)))
                 continue;
             bce_vhci_transfer_queue_pause(&vhci->devices[vhci->port_to_device[i]]->tq[j],
                     BCE_VHCI_PAUSE_SUSPEND);
+            bce_vhci_transfer_queue_quiesce(&vhci->devices[vhci->port_to_device[i]]->tq[j]);
         }
     }
 
@@ -370,7 +480,13 @@ static int bce_vhci_bus_suspend(struct usb_hcd *hcd)
     for (i = 0; i < 16; i++) {
         if (!vhci->port_to_device[i])
             continue;
-        bce_vhci_cmd_port_suspend(&vhci->cq, i);
+        pr_info("bce_vhci: suspend port %d begin (dev %d)\n", i, vhci->port_to_device[i]);
+        status = bce_vhci_cmd_port_suspend(&vhci->cq, i);
+        if (status) {
+            pr_err("bce_vhci: suspend port %d failed (%d)\n", i, status);
+            return status;
+        }
+        pr_info("bce_vhci: suspend port %d done\n", i);
     }
     pr_info("bce_vhci: suspend controller\n");
     if ((status = bce_vhci_cmd_controller_pause(&vhci->cq)))
@@ -392,42 +508,98 @@ static int bce_vhci_bus_resume(struct usb_hcd *hcd)
     struct bce_vhci *vhci = bce_vhci_from_hcd(hcd);
     pr_info("bce_vhci: resume started\n");
 
+    bce_vhci_command_queue_clear_pending(&vhci->cq, "resume start");
+
+    /* resume event queues so we can hear what the T2 says */
     bce_vhci_event_queue_resume(&vhci->ev_system);
     bce_vhci_event_queue_resume(&vhci->ev_isochronous);
     bce_vhci_event_queue_resume(&vhci->ev_interrupt);
     bce_vhci_event_queue_resume(&vhci->ev_asynchronous);
     bce_vhci_event_queue_resume(&vhci->ev_commands);
 
-    pr_info("bce_vhci: resume controller\n");
-    if ((status = bce_vhci_cmd_controller_start(&vhci->cq)))
-        return status;
-
-    pr_info("bce_vhci: resume ports\n");
-    for (i = 0; i < 16; i++) {
-        if (!vhci->port_to_device[i])
-            continue;
-        bce_vhci_cmd_port_resume(&vhci->cq, i);
+    /* cold re-init — ControllerEnable creates a completely fresh
+     * VHCI instance on the T2 side, destroying all prior device/endpoint
+     * state, which is fine. Matches macOS x86 raiseOnePowerStateTo(1). */
+    pr_info("bce_vhci: resume controller enable\n");
+    if ((status = bce_vhci_cmd_controller_enable(&vhci->cq, 1, &vhci->port_mask))) {
+        pr_err("bce_vhci: controller_enable failed: %d\n", status);
+        goto out;
     }
-    pr_info("bce_vhci: resume endpoints\n");
+    pr_info("bce_vhci: resume controller start (port_mask=0x%x)\n", vhci->port_mask);
+    if ((status = bce_vhci_cmd_controller_start(&vhci->cq))) {
+        pr_err("bce_vhci: controller_start failed: %d\n", status);
+        goto out;
+    }
+
+    /*
+     * clean up stale devices tracking locally. ControllerEnable destroys all T2-side device/endpoint state
+     * T2 commands should not be sent for the stale entries, it just causes timeouts, teardown transfer queues locally
+     * and free memory instead
+     */
     for (i = 0; i < 16; i++) {
-        if (!vhci->port_to_device[i])
+        bce_vhci_device_t devid = vhci->port_to_device[i];
+        struct bce_vhci_device *dev;
+        if (!devid)
+            continue;
+        dev = vhci->devices[devid];
+        if (!dev)
             continue;
         for (j = 0; j < 32; j++) {
-            if (!(vhci->devices[vhci->port_to_device[i]]->tq_mask & BIT(j)))
+            if (!(dev->tq_mask & BIT(j)))
                 continue;
-            bce_vhci_transfer_queue_resume(&vhci->devices[vhci->port_to_device[i]]->tq[j],
-                    BCE_VHCI_PAUSE_SUSPEND);
+            if (dev->tq[j].endp)
+                dev->tq[j].endp->hcpriv = NULL;
+            bce_vhci_destroy_transfer_queue(vhci, &dev->tq[j]);
         }
+        kfree(dev);
+        vhci->devices[devid] = NULL;
+        vhci->port_to_device[i] = 0;
+    }
+    vhci->port_power_mask = 0;
+
+    /*
+     * same as macOS raiseOnePowerStateTo(2).
+     * trigger T2 device detection, sends PORT_STATUS_CHANGE as phys devices become online.
+     * Triggers T2 device detection;
+     */
+    pr_info("bce_vhci: resume ports (PortPowerOn, port_mask=0x%x)\n", vhci->port_mask);
+    for (i = 0; i < 16; i++) {
+        if (!(vhci->port_mask & BIT(i)))
+            continue;
+        status = bce_vhci_cmd_port_power_on(&vhci->cq, i);
+        if (status)
+            pr_warn("bce_vhci: port %d power_on failed: %d (non-fatal)\n", i, status);
+        else
+            vhci->port_power_mask |= BIT(i);
+        set_bit(i, &vhci->port_change_pending);
     }
 
-    pr_info("bce_vhci: resume done\n");
-    return 0;
+    /*
+     * then tell the USB core all prioer devices are gone, it triggers async disconnect (free_device for each old device)
+     * and since we already cleared port_to_device, free_device returns immediately (no t2 commands needed) . the hub driver can
+     * then rescan all ports, port_change_pending bits trigger hub_status_data to report changes, and GetPortStatus queries T2
+     * for connection status and then re-enumeration can proceed. DFR reset is really only for cold-boot, after resume, fw remembers.
+     */
+    vhci->dfr_needs_boot_reset = false;
+    cancel_delayed_work(&vhci->w_dfr_reset);
+    if (vhci->dfr_reset_udev) {
+        usb_put_dev(vhci->dfr_reset_udev);
+        vhci->dfr_reset_udev = NULL;
+    }
+
+    usb_root_hub_lost_power(hcd->self.root_hub);
+    status = 0;
+
+out:
+    bce_vhci_command_queue_clear_pending(&vhci->cq,
+            status ? "resume failed" : "resume complete");
+    pr_info("bce_vhci: resume %s\n", status ? "FAILED" : "done");
+    return status;
 }
 
 static int bce_vhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 {
     struct bce_vhci_transfer_queue *q = urb->ep->hcpriv;
-    pr_debug("bce_vhci_urb_enqueue %i:%x\n", q->dev_addr, urb->ep->desc.bEndpointAddress);
     if (!q)
         return -ENOENT;
     return bce_vhci_urb_create(q, urb);
@@ -436,6 +608,8 @@ static int bce_vhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_
 static int bce_vhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 {
     struct bce_vhci_transfer_queue *q = urb->ep->hcpriv;
+    if (!q)
+        return -ENOENT;
     pr_debug("bce_vhci_urb_dequeue %x\n", urb->ep->desc.bEndpointAddress);
     return bce_vhci_urb_request_cancel(q, urb, status);
 }
@@ -487,10 +661,21 @@ static int bce_vhci_drop_endpoint(struct usb_hcd *hcd, struct usb_device *udev, 
     struct bce_vhci *vhci = bce_vhci_from_hcd(hcd);
     bce_vhci_device_t devid = vhci->port_to_device[udev->portnum];
     struct bce_vhci_transfer_queue *q = endp->hcpriv;
-    struct bce_vhci_device *vdev = vhci->devices[devid];
+    struct bce_vhci_device *vdev;
     pr_info("bce_vhci_drop_endpoint %x:%x\n", udev->portnum, endp_index);
+
+    /*
+     * for suspend/resume
+     * the device might've gotten freed during reset, check if its valid
+     */
+    if (!devid || !vhci->devices[devid]) {
+        endp->hcpriv = NULL;
+        return 0;
+    }
+    vdev = vhci->devices[devid];
+
     if (!q) {
-        if (vdev && vdev->tq_mask & BIT(endp_index)) {
+        if (vdev->tq_mask & BIT(endp_index)) {
             pr_err("something deleted the hcpriv?\n");
             q = &vdev->tq[endp_index];
         } else {
@@ -499,8 +684,9 @@ static int bce_vhci_drop_endpoint(struct usb_hcd *hcd, struct usb_device *udev, 
     }
 
     bce_vhci_cmd_endpoint_destroy(&vhci->cq, devid, (u8) (endp->desc.bEndpointAddress & 0x8Fu));
-    vhci->devices[devid]->tq_mask &= ~BIT(endp_index);
+    vdev->tq_mask &= ~BIT(endp_index);
     bce_vhci_destroy_transfer_queue(vhci, q);
+    endp->hcpriv = NULL;
     return 0;
 }
 
@@ -682,26 +868,77 @@ static void bce_vhci_firmware_event_completion(struct bce_queue_sq *sq)
     queue_work(q->vhci->tq_state_wq, &q->vhci->w_fw_events);
 }
 
+static void bce_vhci_dfr_reset_work(struct work_struct *ws)
+{
+    struct bce_vhci *vhci = container_of(ws, struct bce_vhci, w_dfr_reset.work);
+    struct usb_device *udev = vhci->dfr_reset_udev;
+    struct usb_interface *iface;
+
+    if (!udev)
+        return;
+
+    /*
+     * t2-side reset: destroy and re-create all endpoints in a batch after device_create, this activates the DFR subsystem without having to go
+     * through usb_rset_device(), which could cause t2 command queue desync (stray PORT_RESUME?)
+     */
+    pr_info("bce-vhci: performing deferred DFR endpoint activation reset for port %d\n",
+            udev->portnum);
+    bce_vhci_reset_device(vhci, udev->portnum, 0);
+
+    /*
+     * after the t2 reset, the device is left unconfigured, resend set_configuration so the T2 can
+     * assosciate the endpoints create in batch with the activate configuration -> activate DFR
+     */
+    if (udev->actconfig) {
+        int cfg = udev->actconfig->desc.bConfigurationValue;
+        int ret;
+        pr_info("bce-vhci: re-sending SET_CONFIGURATION(%d) to activate DFR\n", cfg);
+        ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+                USB_REQ_SET_CONFIGURATION, 0, cfg, 0,
+                NULL, 0, 5000);
+        if (ret < 0)
+            pr_warn("bce-vhci: SET_CONFIGURATION failed: %d\n", ret);
+    }
+
+    /*
+     * reprobe DFR interface (int 1, config 2), appletbdrm's initial probe failed because
+     * DFR endpoints weren't active. reset + set_configuration makes endpoints active and the probe works
+     */
+    iface = usb_ifnum_to_if(udev, 1);
+    if (iface) {
+        int ret;
+        pr_info("bce-vhci: re-probing DFR display interface\n");
+        ret = device_reprobe(&iface->dev);
+        if (ret)
+            pr_warn("bce-vhci: DFR re-probe failed: %d\n", ret);
+    } else {
+        pr_warn("bce-vhci: DFR display interface not found for re-probe\n");
+    }
+
+    usb_put_dev(udev);
+    vhci->dfr_reset_udev = NULL;
+}
+
+static void bce_vhci_port_change_work(struct work_struct *ws)
+{
+    struct bce_vhci *vhci = container_of(ws, struct bce_vhci, w_port_change);
+    if (vhci->hcd)
+        usb_hcd_poll_rh_status(vhci->hcd);
+}
+
 static void bce_vhci_handle_system_event(struct bce_vhci_event_queue *q, struct bce_vhci_message *msg)
 {
-    struct usb_hcd *hcd = q->vhci->hcd;
+    bce_vhci_record_system_event(q->vhci, msg);
+
     if (msg->cmd & 0x8000) {
         bce_vhci_command_queue_deliver_completion(&q->vhci->cq, msg);
     } else if (msg->cmd == BCE_VHCI_CMD_PORT_STATUS_CHANGE &&
                msg->param1 > 0 &&
                msg->param1 <= q->vhci->port_count) {
-        /* Port status change notification from T2 — flag the port and
-         * tell the USB framework to re-scan so late-initializing devices
-         * (camera, Touch Bar, iBridge) are discovered. */
-        if (hcd) {
-            pr_warn("bce-vhci: Port %u status change event, requesting hub rescan\n",
-                                msg->param1);
-            set_bit(msg->param1, &q->vhci->port_change_pending);
-            usb_hcd_poll_rh_status(hcd);
-        } else {
-            pr_warn("bce-vhci: port %u change received but HCD is NULL\n",
-                                msg->param1);
-        }
+        pr_warn("bce-vhci: Port %u status change event, requesting hub rescan\n",
+                        msg->param1);
+        set_bit(msg->param1, &q->vhci->port_change_pending);
+        schedule_work(&q->vhci->w_port_change);
     } else {
         pr_warn("bce-vhci: Unhandled system event: %x s=%x p1=%x p2=%llx\n",
                 msg->cmd, msg->status, msg->param1, msg->param2);

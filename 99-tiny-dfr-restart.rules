@@ -1,0 +1,2 @@
+# Restart tiny-dfr when appletbdrm DRM card appears (e.g. after resume)
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DRIVERS=="appletbdrm", RUN+="/usr/bin/systemctl restart tiny-dfr"

@@ -22,6 +22,9 @@ void bce_vhci_create_transfer_queue(struct bce_vhci *vhci, struct bce_vhci_trans
     INIT_LIST_HEAD(&q->giveback_urb_list);
     spin_lock_init(&q->urb_lock);
     mutex_init(&q->pause_lock);
+    init_waitqueue_head(&q->drain_waitq);
+    init_waitqueue_head(&q->sq_out_wait_queue);
+    atomic_set(&q->sq_out_pending, 0);
     q->vhci = vhci;
     q->endp = endp;
     q->dev_addr = dev_addr;
@@ -130,6 +133,14 @@ void bce_vhci_transfer_queue_event(struct bce_vhci_transfer_queue *q, struct bce
     struct bce_vhci_urb *turb;
     struct urb *urb;
     spin_lock_irqsave(&q->urb_lock, flags);
+
+    /*
+     * suspend/resume: skip events on inactive queues. during pause the T2 might send events
+     * for endpoints being torn down
+     */
+    if (!q->active)
+        goto complete;
+
     bce_vhci_transfer_queue_deliver_pending(q);
 
     if (msg->cmd == BCE_VHCI_CMD_TRANSFER_REQUEST &&
@@ -160,48 +171,82 @@ static void bce_vhci_transfer_queue_completion(struct bce_queue_sq *sq)
     struct bce_sq_completion_data *c;
     struct urb *urb;
     struct bce_vhci_transfer_queue *q = sq->userdata;
+    bool is_sq_out = (sq == q->sq_out);
     spin_lock_irqsave(&q->urb_lock, flags);
     while ((c = bce_next_completion(sq))) {
-        if (c->status == BCE_COMPLETION_ABORTED) { /* We flushed the queue */
+        /*
+         * suspend /resume: track output completion to allow pause to wait,
+         * required for pending DMA transfers before the queue gets destroyed
+         */
+        if (c->status == BCE_COMPLETION_ABORTED) {
             pr_debug("bce-vhci: [%02x] Got an abort completion\n", q->endp_addr);
+            if (is_sq_out && atomic_dec_if_positive(&q->sq_out_pending) == 0)
+                wake_up(&q->sq_out_wait_queue);
             bce_notify_submission_complete(sq);
             continue;
         }
         if (list_empty(&q->endp->urb_list)) {
             pr_err("bce-vhci: [%02x] Got a completion while no requests are pending\n", q->endp_addr);
+            if (is_sq_out && atomic_dec_if_positive(&q->sq_out_pending) == 0)
+                wake_up(&q->sq_out_wait_queue);
             continue;
         }
         pr_debug("bce-vhci: [%02x] Got a transfer queue completion\n", q->endp_addr);
         urb = list_first_entry(&q->endp->urb_list, struct urb, urb_list);
         bce_vhci_urb_transfer_completion(urb->hcpriv, c);
+        if (is_sq_out && atomic_dec_if_positive(&q->sq_out_pending) == 0)
+            wake_up(&q->sq_out_wait_queue);
         bce_notify_submission_complete(sq);
     }
     bce_vhci_transfer_queue_deliver_pending(q);
     spin_unlock_irqrestore(&q->urb_lock, flags);
     bce_vhci_transfer_queue_giveback(q);
+    wake_up_all(&q->drain_waitq);
 }
+
+#define BCE_VHCI_PAUSE_TIMEOUT_MS 5000
 
 int bce_vhci_transfer_queue_do_pause(struct bce_vhci_transfer_queue *q)
 {
     unsigned long flags;
     int status;
+    int pending;
+    long timeout;
     u8 endp_addr = (u8) (q->endp->desc.bEndpointAddress & 0x8F);
+
     spin_lock_irqsave(&q->urb_lock, flags);
     q->active = false;
     spin_unlock_irqrestore(&q->urb_lock, flags);
-    if (q->sq_out) {
-        pr_err("bce-vhci: Not implemented: wait for pending output requests\n");
-    }
     bce_vhci_transfer_queue_remove_pending(q);
+
     if ((status = bce_vhci_cmd_endpoint_set_state(
             &q->vhci->cq, q->dev_addr, endp_addr, BCE_VHCI_ENDPOINT_PAUSED, &q->state)))
         return status;
     if (q->state != BCE_VHCI_ENDPOINT_PAUSED)
         return -EINVAL;
+
     if (q->sq_in)
         bce_cmd_flush_memory_queue(q->vhci->dev->cmd_cmdq, (u16) q->sq_in->qid);
-    if (q->sq_out)
+
+    if (q->sq_out) {
         bce_cmd_flush_memory_queue(q->vhci->dev->cmd_cmdq, (u16) q->sq_out->qid);
+        /*
+         * suspend/resume: we must WAIT for pending out DMA transfers to complete before we return.
+         * this is done to prevent UAF when the queue is already destroyed, but transfers are still in progress
+         */
+        pending = atomic_read(&q->sq_out_pending);
+        if (pending > 0) {
+            timeout = wait_event_timeout(q->sq_out_wait_queue,
+                    atomic_read(&q->sq_out_pending) == 0,
+                    msecs_to_jiffies(BCE_VHCI_PAUSE_TIMEOUT_MS));
+            if (timeout == 0) {
+                pending = atomic_read(&q->sq_out_pending);
+                if (pending > 0)
+                    pr_warn("bce-vhci: [%02x] Timeout waiting for %d pending output requests\n",
+                            q->endp_addr, pending);
+            }
+        }
+    }
     return 0;
 }
 
@@ -214,15 +259,19 @@ int bce_vhci_transfer_queue_do_resume(struct bce_vhci_transfer_queue *q)
     struct urb *urb, *urbt;
     struct bce_vhci_urb *vurb;
     u8 endp_addr = (u8) (q->endp->desc.bEndpointAddress & 0x8F);
+
     if ((status = bce_vhci_cmd_endpoint_set_state(
             &q->vhci->cq, q->dev_addr, endp_addr, BCE_VHCI_ENDPOINT_ACTIVE, &q->state)))
         return status;
     if (q->state != BCE_VHCI_ENDPOINT_ACTIVE)
         return -EINVAL;
+
     spin_lock_irqsave(&q->urb_lock, flags);
     q->active = true;
     list_for_each_entry_safe(urb, urbt, &q->endp->urb_list, urb_list) {
         vurb = urb->hcpriv;
+        if (!vurb)
+            continue;
         if (vurb->state == BCE_VHCI_URB_INIT_PENDING) {
             if (!bce_vhci_transfer_queue_can_init_urb(q))
                 break;
@@ -262,6 +311,51 @@ int bce_vhci_transfer_queue_resume(struct bce_vhci_transfer_queue *q, enum bce_v
     }
     mutex_unlock(&q->pause_lock);
     return ret;
+}
+
+/**
+ * headache, pretty much what macOS does.
+ * give back all the URBs in progress to a paused TQ
+ * it must be called AFTER the TQ has been paused though (not active, DMA flushed)
+ * URBs that have intermediate states like WAITING_FOR_COMPLETION will never complete
+ * because their DMA was already flushed, so we give them back with -ESHUTDOWN so that the usb drivers
+ * can resubmit on resume. Without this, the endpoints with transfers still in progress at the time of suspend
+ * end up with stuck URBs that block remaining_active_requests and pretty much makes the endpoint permanently dead after
+ * resume.
+ */
+void bce_vhci_transfer_queue_quiesce(struct bce_vhci_transfer_queue *q)
+{
+    struct urb *urb;
+    struct bce_vhci_urb *vurb;
+    unsigned long flags;
+
+    spin_lock_irqsave(&q->urb_lock, flags);
+    while (!list_empty(&q->endp->urb_list)) {
+        urb = list_first_entry(&q->endp->urb_list, struct urb, urb_list);
+        vurb = urb->hcpriv;
+        if (!vurb) {
+            list_del_init(&urb->urb_list);
+            continue;
+        }
+
+        if (vurb->state != BCE_VHCI_URB_INIT_PENDING)
+            ++q->remaining_active_requests;
+
+        usb_hcd_unlink_urb_from_ep(q->vhci->hcd, urb);
+        urb->hcpriv = NULL;
+        urb->status = -ESHUTDOWN;
+        kfree(vurb);
+        list_add_tail(&urb->urb_list, &q->giveback_urb_list);
+    }
+
+    while (!list_empty(&q->giveback_urb_list)) {
+        urb = list_first_entry(&q->giveback_urb_list, struct urb, urb_list);
+        list_del(&urb->urb_list);
+        spin_unlock_irqrestore(&q->urb_lock, flags);
+        usb_hcd_giveback_urb(q->vhci->hcd, urb, urb->status);
+        spin_lock_irqsave(&q->urb_lock, flags);
+    }
+    spin_unlock_irqrestore(&q->urb_lock, flags);
 }
 
 static void bce_vhci_transfer_queue_reset_w(struct work_struct *work)
@@ -409,8 +503,14 @@ int bce_vhci_urb_request_cancel(struct bce_vhci_transfer_queue *q, struct urb *u
     }
 
     vurb = urb->hcpriv;
+    if (!vurb) {
+        usb_hcd_unlink_urb_from_ep(q->vhci->hcd, urb);
+        spin_unlock_irqrestore(&q->urb_lock, flags);
+        usb_hcd_giveback_urb(q->vhci->hcd, urb, status);
+        return 0;
+    }
 
-    old_state = vurb->state; /* save old state to use later because we'll set state as cancelled */
+    old_state = vurb->state;
 
     if (old_state == BCE_VHCI_URB_CANCELLED) {
         spin_unlock_irqrestore(&q->urb_lock, flags);
@@ -512,6 +612,8 @@ static int bce_vhci_urb_send_out_data(struct bce_vhci_urb *urb, dma_addr_t addr,
 
     s = bce_next_submission(urb->q->sq_out);
     bce_set_submission_single(s, addr, size);
+    /* track pending output for safe pause - decremented in completion handler */
+    atomic_inc(&urb->q->sq_out_pending);
     bce_submit_to_device(urb->q->sq_out);
     return 0;
 }
@@ -595,7 +697,7 @@ static int bce_vhci_urb_control_update(struct bce_vhci_urb *urb, struct bce_vhci
         if (msg->cmd == BCE_VHCI_CMD_TRANSFER_REQUEST) {
             if (bce_vhci_urb_send_out_data(urb, urb->urb->setup_dma, sizeof(struct usb_ctrlrequest))) {
                 pr_err("bce-vhci: [%02x] Failed to start URB setup transfer\n", urb->q->endp_addr);
-                return 0; /* TODO: fail the URB? */
+                return 0;
             }
             urb->state = BCE_VHCI_URB_CONTROL_WAITING_FOR_SETUP_COMPLETION;
             pr_debug("bce-vhci: [%02x] Sent setup %llx\n", urb->q->endp_addr, urb->urb->setup_dma);

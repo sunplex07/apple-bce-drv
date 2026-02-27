@@ -129,6 +129,10 @@ static void aaudio_handle_reply(struct aaudio_bce *b, struct aaudio_msg *reply)
         pr_err("aaudio_handle_reply: Tag parse failed: %.4s\n", tag);
         return;
     }
+    if (tagn < 0 || tagn >= AAUDIO_BCE_QUEUE_TAG_COUNT) {
+        pr_err("aaudio_handle_reply: Tag out of range: %.4s (%d)\n", tag, tagn);
+        return;
+    }
 
     spin_lock_irqsave(&b->spinlock, irq_flags);
     entry = b->pending_entries[tagn];

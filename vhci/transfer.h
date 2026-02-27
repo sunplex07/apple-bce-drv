@@ -2,6 +2,7 @@
 #define BCEDRIVER_TRANSFER_H
 
 #include <linux/usb.h>
+#include <linux/wait.h>
 #include "queue.h"
 #include "command.h"
 #include "../queue.h"
@@ -32,6 +33,9 @@ struct bce_vhci_transfer_queue {
     struct spinlock urb_lock;
     struct mutex pause_lock;
     struct list_head giveback_urb_list;
+    wait_queue_head_t drain_waitq;
+    wait_queue_head_t sq_out_wait_queue;
+    atomic_t sq_out_pending;
 
     struct work_struct w_reset;
 };
@@ -64,6 +68,7 @@ int bce_vhci_transfer_queue_do_pause(struct bce_vhci_transfer_queue *q);
 int bce_vhci_transfer_queue_do_resume(struct bce_vhci_transfer_queue *q);
 int bce_vhci_transfer_queue_pause(struct bce_vhci_transfer_queue *q, enum bce_vhci_pause_source src);
 int bce_vhci_transfer_queue_resume(struct bce_vhci_transfer_queue *q, enum bce_vhci_pause_source src);
+void bce_vhci_transfer_queue_quiesce(struct bce_vhci_transfer_queue *q);
 void bce_vhci_transfer_queue_request_reset(struct bce_vhci_transfer_queue *q);
 
 int bce_vhci_urb_create(struct bce_vhci_transfer_queue *q, struct urb *urb);

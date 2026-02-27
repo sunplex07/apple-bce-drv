@@ -336,8 +336,20 @@ int aaudio_cmd_get_output_stream_list(struct aaudio_device *a, struct aaudio_msg
 }
 int aaudio_cmd_set_remote_access(struct aaudio_device *a, u64 mode)
 {
-    CMD_DEF_SHARED_AND_SEND(aaudio_msg_write_set_remote_access, mode);
-    CMD_HNDL_REPLY_AND_FREE(aaudio_msg_read_set_remote_access_response);
+    return aaudio_cmd_set_remote_access_timeout(a, mode, 500);
+}
+
+int aaudio_cmd_set_remote_access_timeout(struct aaudio_device *a, u64 mode, unsigned int timeout_ms)
+{
+    int status;
+    struct aaudio_send_ctx sctx;
+    struct aaudio_msg reply = aaudio_reply_alloc();
+
+    status = aaudio_send_cmd_sync(a, &sctx, &reply, timeout_ms, aaudio_msg_write_set_remote_access, mode);
+    if (!status)
+        status = aaudio_msg_read_set_remote_access_response(&reply);
+    aaudio_reply_free(&reply);
+    return status;
 }
 int aaudio_cmd_get_device_list(struct aaudio_device *a, struct aaudio_msg *buf,
         aaudio_device_id_t **dev_l, u64 *dev_cnt)

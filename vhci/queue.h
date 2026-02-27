@@ -6,6 +6,7 @@
 
 #define VHCI_EVENT_QUEUE_EL_COUNT 256
 #define VHCI_EVENT_PENDING_COUNT 32
+#define VHCI_CMD_PENDING_COUNT 64
 
 struct bce_vhci;
 struct bce_vhci_event_queue;
@@ -46,6 +47,12 @@ struct bce_vhci_event_queue {
 struct bce_vhci_command_queue_completion {
     struct bce_vhci_message *result;
     struct completion completion;
+    u16 expected_cmd;
+    u32 expected_param1;
+    bool waiting;
+    struct bce_vhci_message pending[VHCI_CMD_PENDING_COUNT];
+    u16 pending_head;
+    u16 pending_count;
 };
 struct bce_vhci_command_queue {
     struct bce_vhci_message_queue *mq;
@@ -72,5 +79,6 @@ void bce_vhci_command_queue_destroy(struct bce_vhci_command_queue *cq);
 int bce_vhci_command_queue_execute(struct bce_vhci_command_queue *cq, struct bce_vhci_message *req,
         struct bce_vhci_message *res, unsigned long timeout);
 void bce_vhci_command_queue_deliver_completion(struct bce_vhci_command_queue *cq, struct bce_vhci_message *msg);
+void bce_vhci_command_queue_clear_pending(struct bce_vhci_command_queue *cq, const char *reason);
 
 #endif //BCE_VHCI_QUEUE_H

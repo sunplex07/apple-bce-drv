@@ -11,6 +11,8 @@ struct bce_vhci_device {
     struct bce_vhci_transfer_queue tq[32];
     u32 tq_mask;
 };
+#define BCE_VHCI_SYS_EVENT_LOG_SIZE 32
+
 struct bce_vhci {
     struct apple_bce_device *dev;
     dev_t vdevt;
@@ -37,7 +39,15 @@ struct bce_vhci {
     struct bce_vhci_device *devices[16];
     struct workqueue_struct *tq_state_wq;
     struct work_struct w_fw_events;
+    struct work_struct w_port_change;
+    struct delayed_work w_dfr_reset;
+    struct usb_device *dfr_reset_udev;
+    bool dfr_needs_boot_reset;
     unsigned long port_change_pending;
+    spinlock_t sys_event_log_lock;
+    struct bce_vhci_message sys_event_log[BCE_VHCI_SYS_EVENT_LOG_SIZE];
+    u32 sys_event_log_head;
+    u32 sys_event_log_count;
 };
 
 int __init bce_vhci_module_init(void);
@@ -49,5 +59,6 @@ int bce_vhci_start(struct usb_hcd *hcd);
 void bce_vhci_stop(struct usb_hcd *hcd);
 
 struct bce_vhci *bce_vhci_from_hcd(struct usb_hcd *hcd);
+void bce_vhci_dump_recent_system_events(struct bce_vhci *vhci, const struct bce_vhci_message *req);
 
 #endif //BCE_VHCI_H
