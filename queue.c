@@ -290,8 +290,8 @@ u32 bce_cmd_register_queue(struct bce_queue_cmdq *cmdq, struct bce_queue_memcfg 
 
     pr_info("apple-bce: register_queue: qid=%d el_count=%d vec_or_cq=%d flags=0x%x "
             "addr=0x%llx len=0x%x name=%s dirout=%d\n",
-            cfg->qid, cfg->el_count, cfg->vector_or_cq, cmd->flags,
-            cfg->addr, cfg->length, name ? name : "(null)", isdirout);
+            cfg->qid, cfg->el_count, cfg->vector_or_cq, (unsigned int)cmd->flags,
+            (unsigned long long)cfg->addr, (unsigned int)cfg->length, name ? name : "(null)", isdirout);
 
     bce_cmd_finish(cmdq, &res);
 

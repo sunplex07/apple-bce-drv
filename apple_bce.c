@@ -5,9 +5,6 @@
 #include "vhci/command.h"
 #include <linux/version.h>
 
-/* Exported by applesmc — for sysfs testing without real suspend */
-extern int applesmc_t2_prepare_sleep(void);
-extern int applesmc_t2_prepare_wake(void);
 
 static dev_t bce_chrdev;
 static struct class *bce_class;
@@ -583,12 +580,31 @@ static int apple_bce_suspend(struct device *dev)
     return 0;
 }
 
+static void bce_deferred_reinit_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(bce_reinit_dwork, bce_deferred_reinit_work);
+
+static void bce_deferred_reinit_work(struct work_struct *work)
+{
+    int status;
+
+    if (!global_bce)
+        return;
+
+    pr_info("apple-bce: deferred reinit: starting (200ms after resume)\n");
+    status = apple_bce_hard_reinit(global_bce);
+    if (status)
+        pr_err("apple-bce: deferred reinit: FAILED (%d)\n", status);
+    else
+        pr_info("apple-bce: deferred reinit: complete\n");
+}
+
 static int apple_bce_resume(struct device *dev)
 {
-    /* Pure no-op. Device was fully torn down in suspend.
-     * VHCI doesn't exist, no IRQs, no queues — nothing to resume.
-     * Reinit triggered manually via: echo 99 > test_t2_sleep */
-    pr_info("apple-bce: resume: no-op (reinit via sysfs)\n");
+    /* Schedule reinit 200ms after resume completes — late enough that
+     * all PCI devices are restored and the T2 PCIe endpoint is ready,
+     * but fast enough the user barely notices. */
+    pr_info("apple-bce: resume: scheduling deferred reinit (200ms)\n");
+    schedule_delayed_work(&bce_reinit_dwork, msecs_to_jiffies(200));
     return 0;
 }
 
@@ -701,159 +717,6 @@ static int test_t2_sleep_set(const char *val, const struct kernel_param *kp)
         else
             pr_emerg("apple-bce: 0x15 failed (%d)\n", status);
         return 0;
-    /* Listen for 10s */
-    } else if (cmd == 3) {
-        int status, i;
-        u64 msg;
-        pr_emerg("apple-bce: LISTEN 10s\n");
-        for (i = 0; i < 2; i++) {
-            status = bce_mailbox_wait_unsolicited(&global_bce->mbox, &msg, 5000);
-            if (!status)
-                pr_emerg("apple-bce: GOT MESSAGE type=0x%x value=0x%llx raw=0x%llx\n",
-                         BCE_MB_TYPE(msg), BCE_MB_VALUE(msg), msg);
-            else
-                pr_emerg("apple-bce: timeout\n");
-        }
-        return 0;
-
-    /* Test A (cmd=10): Write SMC keys, then listen for unsolicited T2 messages */
-    } else if (cmd == 10) {
-        int status, i;
-        u64 msg;
-        pr_emerg("apple-bce: TEST A: write SMC keys, then listen for T2\n");
-        status = applesmc_t2_prepare_sleep();
-        pr_emerg("apple-bce: TEST A: SMC sleep prep returned %d\n", status);
-        if (status)
-            return status;
-        /* Listen for up to 30 seconds in 5-second intervals */
-        for (i = 0; i < 6; i++) {
-            pr_emerg("apple-bce: TEST A: listening for T2 message (%d/6, 5s)...\n", i + 1);
-            status = bce_mailbox_wait_unsolicited(&global_bce->mbox, &msg, 5000);
-            if (!status) {
-                pr_emerg("apple-bce: TEST A: GOT MESSAGE type=0x%x value=0x%llx raw=0x%llx\n",
-                         BCE_MB_TYPE(msg), BCE_MB_VALUE(msg), msg);
-            } else {
-                pr_emerg("apple-bce: TEST A: timeout (%d)\n", status);
-            }
-        }
-        pr_emerg("apple-bce: TEST A: done listening, sending SMC wake keys\n");
-        applesmc_t2_prepare_wake();
-        return 0;
-
-    /* Test B (cmd=11): Send 0x14, then listen for T2 response */
-    } else if (cmd == 11) {
-        int status, i;
-        u64 msg;
-        pr_emerg("apple-bce: TEST B: send 0x14, then listen for T2\n");
-        status = bce_mailbox_send_noreply(&global_bce->mbox,
-                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0));
-        pr_emerg("apple-bce: TEST B: sent 0x14, status=%d\n", status);
-        for (i = 0; i < 6; i++) {
-            pr_emerg("apple-bce: TEST B: listening (%d/6, 5s)...\n", i + 1);
-            status = bce_mailbox_wait_unsolicited(&global_bce->mbox, &msg, 5000);
-            if (!status) {
-                pr_emerg("apple-bce: TEST B: GOT MESSAGE type=0x%x value=0x%llx raw=0x%llx\n",
-                         BCE_MB_TYPE(msg), BCE_MB_VALUE(msg), msg);
-            } else {
-                pr_emerg("apple-bce: TEST B: timeout (%d)\n", status);
-            }
-        }
-        return 0;
-
-    /* Test C (cmd=12): SMC keys + 0x14, listen, then send 0x1A ACK */
-    } else if (cmd == 12) {
-        int status, i;
-        u64 msg;
-        pr_emerg("apple-bce: TEST C: SMC keys + 0x14, listen, ACK\n");
-        status = applesmc_t2_prepare_sleep();
-        pr_emerg("apple-bce: TEST C: SMC sleep prep returned %d\n", status);
-        status = bce_mailbox_send_noreply(&global_bce->mbox,
-                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0));
-        pr_emerg("apple-bce: TEST C: sent 0x14, status=%d\n", status);
-        /* Listen for T2's 0x17 response */
-        for (i = 0; i < 6; i++) {
-            pr_emerg("apple-bce: TEST C: listening (%d/6, 5s)...\n", i + 1);
-            status = bce_mailbox_wait_unsolicited(&global_bce->mbox, &msg, 5000);
-            if (!status) {
-                pr_emerg("apple-bce: TEST C: GOT MESSAGE type=0x%x value=0x%llx raw=0x%llx\n",
-                         BCE_MB_TYPE(msg), BCE_MB_VALUE(msg), msg);
-                /* If we got 0x17, send ACK (0x1A) */
-                if (BCE_MB_TYPE(msg) == BCE_MB_SAVE_STATE_AND_SLEEP) {
-                    pr_emerg("apple-bce: TEST C: got 0x17! Sending 0x1A ACK\n");
-                    bce_mailbox_send_noreply(&global_bce->mbox,
-                            BCE_MB_MSG(BCE_MB_SAVE_RESTORE_STATE_COMPLETE, 0));
-                }
-                break;
-            }
-            pr_emerg("apple-bce: TEST C: timeout (%d)\n", status);
-        }
-        /* Wait a bit then wake */
-        pr_emerg("apple-bce: TEST C: sending SMC wake keys\n");
-        applesmc_t2_prepare_wake();
-        return 0;
-
-    /* Test D (cmd=20): Send 0x14 synchronously — see if T2 replies */
-    } else if (cmd == 20) {
-        int status;
-        u64 resp;
-        pr_emerg("apple-bce: TEST D: send 0x14 synchronously (wait for reply)\n");
-        status = bce_mailbox_send(&global_bce->mbox,
-                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0), &resp);
-        if (!status)
-            pr_emerg("apple-bce: TEST D: T2 replied type=0x%x value=0x%llx raw=0x%llx\n",
-                     BCE_MB_TYPE(resp), BCE_MB_VALUE(resp), resp);
-        else
-            pr_emerg("apple-bce: TEST D: no reply (status=%d)\n", status);
-        return 0;
-
-    /* Test E (cmd=21): 0x14 fire-forget, 2s wait, then 0x15 (RESTORE_NO_STATE) to recover */
-    } else if (cmd == 21) {
-        int status;
-        u64 resp;
-        pr_emerg("apple-bce: TEST E: 0x14 then recover with 0x15\n");
-        bce_mailbox_send_noreply(&global_bce->mbox,
-                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0));
-        pr_emerg("apple-bce: TEST E: 0x14 sent, waiting 2s...\n");
-        msleep(2000);
-        pr_emerg("apple-bce: TEST E: sending 0x15 (RESTORE_NO_STATE)\n");
-        status = bce_mailbox_send(&global_bce->mbox,
-                BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp);
-        if (!status)
-            pr_emerg("apple-bce: TEST E: T2 replied type=0x%x value=0x%llx raw=0x%llx\n",
-                     BCE_MB_TYPE(resp), BCE_MB_VALUE(resp), resp);
-        else
-            pr_emerg("apple-bce: TEST E: no reply (status=%d)\n", status);
-        return 0;
-
-    /* Test F (cmd=22): SMC keys + 0x14, listen 10s, then 0x15 recover + SMC wake */
-    } else if (cmd == 22) {
-        int status, i;
-        u64 resp, msg;
-        pr_emerg("apple-bce: TEST F: SMC + 0x14, listen, then 0x15 recover\n");
-        applesmc_t2_prepare_sleep();
-        pr_emerg("apple-bce: TEST F: SMC keys written\n");
-        bce_mailbox_send_noreply(&global_bce->mbox,
-                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0));
-        pr_emerg("apple-bce: TEST F: 0x14 sent, listening 10s...\n");
-        for (i = 0; i < 2; i++) {
-            status = bce_mailbox_wait_unsolicited(&global_bce->mbox, &msg, 5000);
-            if (!status)
-                pr_emerg("apple-bce: TEST F: GOT MESSAGE type=0x%x value=0x%llx raw=0x%llx\n",
-                         BCE_MB_TYPE(msg), BCE_MB_VALUE(msg), msg);
-            else
-                pr_emerg("apple-bce: TEST F: timeout (%d)\n", status);
-        }
-        pr_emerg("apple-bce: TEST F: sending 0x15 (RESTORE_NO_STATE)\n");
-        status = bce_mailbox_send(&global_bce->mbox,
-                BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp);
-        if (!status)
-            pr_emerg("apple-bce: TEST F: T2 replied type=0x%x value=0x%llx raw=0x%llx\n",
-                     BCE_MB_TYPE(resp), BCE_MB_VALUE(resp), resp);
-        else
-            pr_emerg("apple-bce: TEST F: 0x15 no reply (status=%d)\n", status);
-        applesmc_t2_prepare_wake();
-        pr_emerg("apple-bce: TEST F: done\n");
-        return 0;
     }
     return -EINVAL;
 }
@@ -861,7 +724,7 @@ static const struct kernel_param_ops test_t2_sleep_ops = {
     .set = test_t2_sleep_set,
 };
 module_param_cb(test_t2_sleep, &test_t2_sleep_ops, NULL, 0200);
-MODULE_PARM_DESC(test_t2_sleep, "20=D(0x14 sync), 21=E(0x14+0x15 recover), 22=F(SMC+0x14+0x15)");
+MODULE_PARM_DESC(test_t2_sleep, "99=hard reinit, 1=send 0x14, 2=send 0x15");
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("MrARM");
