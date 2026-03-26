@@ -583,31 +583,12 @@ static int apple_bce_suspend(struct device *dev)
     return 0;
 }
 
-static void bce_deferred_reinit_work(struct work_struct *work);
-static DECLARE_DELAYED_WORK(bce_reinit_dwork, bce_deferred_reinit_work);
-
-static void bce_deferred_reinit_work(struct work_struct *work)
-{
-    int status;
-
-    if (!global_bce)
-        return;
-
-    pr_info("apple-bce: deferred reinit: starting (200ms after resume)\n");
-    status = apple_bce_hard_reinit(global_bce);
-    if (status)
-        pr_err("apple-bce: deferred reinit: FAILED (%d)\n", status);
-    else
-        pr_info("apple-bce: deferred reinit: complete\n");
-}
-
 static int apple_bce_resume(struct device *dev)
 {
-    /* Schedule reinit 200ms after resume completes — late enough that
-     * all PCI devices are restored and the T2 PCIe endpoint is ready,
-     * but fast enough the user barely notices. */
-    pr_info("apple-bce: resume: scheduling deferred reinit (200ms)\n");
-    schedule_delayed_work(&bce_reinit_dwork, msecs_to_jiffies(200));
+    /* Pure no-op. Device was fully torn down in suspend.
+     * VHCI doesn't exist, no IRQs, no queues — nothing to resume.
+     * Reinit triggered manually via: echo 99 > test_t2_sleep */
+    pr_info("apple-bce: resume: no-op (reinit via sysfs)\n");
     return 0;
 }
 
