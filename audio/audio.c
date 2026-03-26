@@ -175,29 +175,15 @@ static void aaudio_remove(struct pci_dev *dev)
 
 static int aaudio_suspend(struct device *dev)
 {
-    struct aaudio_device *aaudio = pci_get_drvdata(to_pci_dev(dev));
-
-    if (aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_OFF))
-        dev_warn(aaudio->dev, "Failed to reset remote access\n");
-
-    pci_disable_device(aaudio->pci);
+    /* DIAG: no-op suspend to isolate panic source */
+    pr_info("aaudio: suspend: NO-OP (diagnostic mode)\n");
     return 0;
 }
 
 static int aaudio_resume(struct device *dev)
 {
-    int status;
-    struct aaudio_device *aaudio = pci_get_drvdata(to_pci_dev(dev));
-
-    if ((status = pci_enable_device(aaudio->pci)))
-        return status;
-    pci_set_master(aaudio->pci);
-
-    if ((status = aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_ON))) {
-        dev_err(aaudio->dev, "Failed to set remote access\n");
-        return status;
-    }
-
+    /* DIAG: no-op resume to match no-op suspend */
+    pr_info("aaudio: resume: NO-OP (diagnostic mode)\n");
     return 0;
 }
 

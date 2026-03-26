@@ -7,6 +7,7 @@
 
 struct bce_mailbox {
     void __iomem *reg_mb;
+    struct pci_dev *pci;
 
     atomic_t mb_status; // possible statuses: 0 (no msg), 1 (has active msg), 2 (got reply)
     struct completion mb_completion;
@@ -18,10 +19,11 @@ enum bce_message_type {
     BCE_MB_REGISTER_COMMAND_CQ = 0x8,            // to-device
     BCE_MB_REGISTER_COMMAND_QUEUE_REPLY = 0xB,   // to-host
     BCE_MB_SET_FW_PROTOCOL_VERSION = 0xC,        // both
-    BCE_MB_SLEEP_NO_STATE = 0x14,                // to-device
+    BCE_MB_SLEEP_NO_STATE = 0x14,                // to-device (fire-and-forget fallback)
     BCE_MB_RESTORE_NO_STATE = 0x15,              // to-device
+    BCE_MB_SAVE_STATE = 0x16,                    // to-device (fire-and-forget pre-signal)
     BCE_MB_SAVE_STATE_AND_SLEEP = 0x17,          // to-device
-    BCE_MB_RESTORE_STATE_AND_WAKE = 0x18,        // to-device
+    BCE_MB_RESTORE_STATE_AND_WAKE = 0x1B,        // to-device (verified from macOS binary offset 0x2424e92)
     BCE_MB_SAVE_STATE_AND_SLEEP_FAILURE = 0x19,  // from-device
     BCE_MB_SAVE_RESTORE_STATE_COMPLETE = 0x1A,   // from-device
 };
@@ -30,11 +32,18 @@ enum bce_message_type {
 #define BCE_MB_TYPE(v) ((u32) (v >> 58))
 #define BCE_MB_VALUE(v) (v & 0x3FFFFFFFFFFFFFFLL)
 
-void bce_mailbox_init(struct bce_mailbox *mb, void __iomem *reg_mb);
+void bce_mailbox_init(struct bce_mailbox *mb, void __iomem *reg_mb, struct pci_dev *pci);
 
 int bce_mailbox_send(struct bce_mailbox *mb, u64 msg, u64* recv);
 
 int bce_mailbox_handle_interrupt(struct bce_mailbox *mb);
+
+int bce_mailbox_send_noreply(struct bce_mailbox *mb, u64 msg);
+
+int bce_mailbox_send_poll(struct bce_mailbox *mb, u64 msg, u64 *recv,
+                          unsigned long timeout_ms);
+
+int bce_mailbox_wait_unsolicited(struct bce_mailbox *mb, u64 *recv, unsigned long timeout_ms);
 
 
 struct bce_timestamp {
@@ -48,6 +57,6 @@ void bce_timestamp_init(struct bce_timestamp *ts, void __iomem *reg);
 
 void bce_timestamp_start(struct bce_timestamp *ts, bool is_initial);
 
-void bce_timestamp_stop(struct bce_timestamp *ts);
+void bce_timestamp_stop(struct bce_timestamp *ts, struct pci_dev *pci);
 
 #endif //BCEDRIVER_MAILBOX_H

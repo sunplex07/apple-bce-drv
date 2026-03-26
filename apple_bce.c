@@ -2,7 +2,12 @@
 #include <linux/module.h>
 #include <linux/crc32.h>
 #include "audio/audio.h"
+#include "vhci/command.h"
 #include <linux/version.h>
+
+/* Exported by applesmc — for sysfs testing without real suspend */
+extern int applesmc_t2_prepare_sleep(void);
+extern int applesmc_t2_prepare_wake(void);
 
 static dev_t bce_chrdev;
 static struct class *bce_class;
@@ -61,7 +66,7 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
         goto fail;
     }
 
-    bce_mailbox_init(&bce->mbox, bce->reg_mem_mb);
+    bce_mailbox_init(&bce->mbox, bce->reg_mem_mb, bce->pci);
     bce_timestamp_init(&bce->timestamp, bce->reg_mem_mb);
 
     spin_lock_init(&bce->queues_lock);
@@ -106,7 +111,7 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
     return 0;
 
 fail_ts:
-    bce_timestamp_stop(&bce->timestamp);
+    bce_timestamp_stop(&bce->timestamp, bce->pci);
 #ifndef WITHOUT_NVME_PATCH
     pci_disable_device(bce->pci0);
 fail_dev0:
@@ -243,7 +248,7 @@ static void apple_bce_remove(struct pci_dev *dev)
 
     bce_vhci_destroy(&bce->vhci);
 
-    bce_timestamp_stop(&bce->timestamp);
+    bce_timestamp_stop(&bce->timestamp, bce->pci);
 #ifndef WITHOUT_NVME_PATCH
     pci_disable_device(bce->pci0);
 #endif
@@ -268,30 +273,56 @@ static int bce_save_state_and_sleep(struct apple_bce_device *bce)
     void *dma_ptr = NULL;
     size_t size = max(PAGE_SIZE, 4096UL);
 
+    pr_info("apple-bce: suspend: entering bce_save_state_and_sleep\n");
+
+    /* Fire-and-forget pre-signal: tells T2 to prepare for state serialization.
+     * macOS sends this before the synchronous SAVE_STATE_AND_SLEEP (0x17). */
+    bce_mailbox_send_noreply(&bce->mbox, BCE_MB_MSG(BCE_MB_SAVE_STATE, 0));
+    pr_info("apple-bce: suspend: pre-signal sent\n");
+
     for (attempt = 0; attempt < 5; ++attempt) {
-        pr_debug("apple-bce: suspend: attempt %i, buffer size %li\n", attempt, size);
+        pr_info("apple-bce: suspend: attempt %i, buffer size %zu\n", attempt, size);
         dma_ptr = dma_alloc_coherent(&bce->pci->dev, size, &dma_addr, GFP_KERNEL);
         if (!dma_ptr) {
             pr_err("apple-bce: suspend failed (data alloc failed)\n");
             break;
         }
-        BUG_ON((dma_addr % 4096) != 0);
+        if ((dma_addr % 4096) != 0) {
+            pr_err("apple-bce: suspend: unaligned DMA addr %pad\n", &dma_addr);
+            dma_free_coherent(&bce->pci->dev, size, dma_ptr, dma_addr);
+            return -EINVAL;
+        }
+        pr_info("apple-bce: suspend: sending SAVE_STATE_AND_SLEEP (dma=%pad size=%zu)\n",
+                &dma_addr, size);
         status = bce_mailbox_send(&bce->mbox,
                 BCE_MB_MSG(BCE_MB_SAVE_STATE_AND_SLEEP, (dma_addr & ~(4096LLU - 1)) | (size / 4096)), &resp);
         if (status) {
-            pr_err("apple-bce: suspend failed (mailbox send)\n");
+            pr_err("apple-bce: suspend failed (mailbox send, status=%d)\n", status);
             break;
         }
+        pr_info("apple-bce: suspend: T2 responded type=0x%x value=0x%llx\n",
+                BCE_MB_TYPE(resp), BCE_MB_VALUE(resp));
         if (BCE_MB_TYPE(resp) == BCE_MB_SAVE_RESTORE_STATE_COMPLETE) {
             bce->saved_data_dma_addr = dma_addr;
             bce->saved_data_dma_ptr = dma_ptr;
             bce->saved_data_dma_size = size;
+            pr_info("apple-bce: suspend: state saved successfully\n");
             return 0;
         } else if (BCE_MB_TYPE(resp) == BCE_MB_SAVE_STATE_AND_SLEEP_FAILURE) {
+            size_t new_size;
             dma_free_coherent(&bce->pci->dev, size, dma_ptr, dma_addr);
+            dma_ptr = NULL;
             /* The 0x10ff magic value was extracted from Apple's driver */
-            size = (BCE_MB_VALUE(resp) + 0x10ff) & ~(4096LLU - 1);
-            pr_debug("apple-bce: suspend: device requested a larger buffer (%li)\n", size);
+            new_size = (BCE_MB_VALUE(resp) + 0x10ff) & ~(4096LLU - 1);
+            /* macOS validates: new > old AND < 1MB+1 (prevents infinite loop / OOM) */
+            if (new_size <= size || new_size > 0x100001) {
+                pr_err("apple-bce: suspend: invalid resize request %zu (was %zu)\n",
+                       new_size, size);
+                status = -EINVAL;
+                break;
+            }
+            size = new_size;
+            pr_debug("apple-bce: suspend: device requested a larger buffer (%zu)\n", size);
             continue;
         } else {
             pr_err("apple-bce: suspend failed (invalid device response)\n");
@@ -301,9 +332,10 @@ static int bce_save_state_and_sleep(struct apple_bce_device *bce)
     }
     if (dma_ptr)
         dma_free_coherent(&bce->pci->dev, size, dma_ptr, dma_addr);
-    if (!status)
-        return bce_mailbox_send(&bce->mbox, BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0), &resp);
-    return status;
+    /* Abort: tell T2 to restore its own state (fire-and-forget, matching macOS).
+     * macOS aborts suspend when the state buffer cannot be allocated. */
+    bce_mailbox_send_noreply(&bce->mbox, BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0));
+    return status ? status : -ENOMEM;
 }
 
 static int bce_restore_state_and_wake(struct apple_bce_device *bce)
@@ -325,46 +357,257 @@ static int bce_restore_state_and_wake(struct apple_bce_device *bce)
     if ((status = bce_mailbox_send(&bce->mbox, BCE_MB_MSG(BCE_MB_RESTORE_STATE_AND_WAKE,
             (bce->saved_data_dma_addr & ~(4096LLU - 1)) | (bce->saved_data_dma_size / 4096)), &resp))) {
         pr_err("apple-bce: resume with state failed (mailbox send)\n");
-        goto finish_with_state;
+        goto try_no_state;
     }
     if (BCE_MB_TYPE(resp) != BCE_MB_SAVE_RESTORE_STATE_COMPLETE) {
         pr_err("apple-bce: resume with state failed (invalid device response)\n");
-        status = -EINVAL;
-        goto finish_with_state;
+        goto try_no_state;
     }
-
-finish_with_state:
+    /* State restore succeeded */
     dma_free_coherent(&bce->pci->dev, bce->saved_data_dma_size, bce->saved_data_dma_ptr, bce->saved_data_dma_addr);
     bce->saved_data_dma_ptr = NULL;
+    return 0;
+
+try_no_state:
+    /* State restore failed — T2 may have cold-booted.
+     * Free the (now useless) state buffer and try stateless recovery. */
+    dma_free_coherent(&bce->pci->dev, bce->saved_data_dma_size, bce->saved_data_dma_ptr, bce->saved_data_dma_addr);
+    bce->saved_data_dma_ptr = NULL;
+    pr_warn("apple-bce: attempting stateless resume (RESTORE_NO_STATE)\n");
+    if ((status = bce_mailbox_send(&bce->mbox, BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp))) {
+        pr_err("apple-bce: stateless resume also failed (mailbox send)\n");
+        return status;
+    }
+    if (BCE_MB_TYPE(resp) != BCE_MB_RESTORE_NO_STATE) {
+        pr_err("apple-bce: stateless resume failed (invalid device response)\n");
+        return -EINVAL;
+    }
+    pr_warn("apple-bce: stateless resume succeeded — T2 likely rebooted\n");
+    return 0;
+}
+
+/*
+ * Hard teardown: full PCI-level shutdown.  Tears down everything that
+ * remove() does EXCEPT: bce struct, PCI regions, iomapped BARs, and
+ * sysfs/chardev entries.  The goal is to make the PCI core see a fully
+ * quiesced device so it can enter D3cold — matching what happens when
+ * the driver is unbound via rmmod.
+ *
+ * Kept alive across suspend (no need to redo on reinit):
+ *   - bce struct (kzalloc'd once in probe)
+ *   - pci_request_regions (BAR claims — driver stays bound)
+ *   - pci_iomap BAR4/BAR2 (virtual mappings survive D3cold because
+ *     pci_restore_state() rewrites the same BAR addresses)
+ *   - device_create / chardev (sysfs entries)
+ *   - pci0 reference (pci_get_slot — slot doesn't change)
+ */
+static void apple_bce_hard_teardown(struct apple_bce_device *bce)
+{
+    struct pci_dev *dev = bce->pci;
+
+    pr_info("apple-bce: hard teardown: destroying VHCI\n");
+    bce->is_being_removed = true;
+    bce_vhci_destroy(&bce->vhci);
+
+    pr_info("apple-bce: hard teardown: stopping timestamp + freeing queues\n");
+    bce_timestamp_stop(&bce->timestamp, bce->pci);
+    bce_free_command_queues(bce);
+
+    pr_info("apple-bce: hard teardown: freeing IRQs + MSI vectors\n");
+    pci_free_irq(dev, 0, dev);
+    pci_free_irq(dev, 4, dev);
+    pci_free_irq_vectors(dev);
+
+    pr_info("apple-bce: hard teardown: disabling bus master + device\n");
+    pci_clear_master(dev);
+#ifndef WITHOUT_NVME_PATCH
+    /* Only touch pci0 if we own it (no nvme driver on function 0) */
+    pci_clear_master(bce->pci0);
+    pci_disable_device(bce->pci0);
+#endif
+    pci_disable_device(dev);
+
+    bce->is_being_removed = false;
+    pr_info("apple-bce: hard teardown: complete — device fully quiesced\n");
+}
+
+/*
+ * Hard re-init: full PCI-level bringup.  Redoes everything that probe()
+ * does EXCEPT the resources kept alive by hard_teardown (struct, regions,
+ * iomaps, sysfs).  This is the resume counterpart of hard_teardown.
+ *
+ * The PCI core has already called pci_restore_state() by the time we
+ * get here (.resume runs after .resume_noirq), so config space / BARs
+ * are restored and the device is in D0.
+ */
+static int apple_bce_hard_reinit(struct apple_bce_device *bce)
+{
+    struct pci_dev *dev = bce->pci;
+    int status;
+    int nvec;
+
+    pr_info("apple-bce: hard reinit: starting\n");
+
+    /* Clear the teardown flag so queue destroy paths during USB reset
+     * cycles will properly ida_free() qids and reuse them. Without this,
+     * qids leak and the T2 rejects registration at higher indices. */
+    bce->is_being_removed = false;
+
+    /* --- PCI-level bringup (matches probe order) --- */
+    if ((status = pci_enable_device(dev))) {
+        pr_err("apple-bce: hard reinit: pci_enable_device failed (%d)\n", status);
+        return status;
+    }
+    pci_set_master(dev);
+
+    nvec = pci_alloc_irq_vectors(dev, 1, 8, PCI_IRQ_MSI);
+    if (nvec < 5) {
+        pr_err("apple-bce: hard reinit: MSI alloc failed (got %d)\n", nvec);
+        status = -EINVAL;
+        goto fail_disable;
+    }
+
+    if ((status = dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(37)))) {
+        pr_err("apple-bce: hard reinit: DMA mask failed (%d)\n", status);
+        goto fail_msi;
+    }
+
+#ifndef WITHOUT_NVME_PATCH
+    if ((status = pci_enable_device_mem(bce->pci0))) {
+        pr_err("apple-bce: hard reinit: pci0 enable failed (%d)\n", status);
+        goto fail_msi;
+    }
+#endif
+    pci_set_master(bce->pci0);
+
+    /* --- IRQ handlers --- */
+    if ((status = pci_request_irq(dev, 0, bce_handle_mb_irq, NULL, dev, "bce_mbox"))) {
+        pr_err("apple-bce: hard reinit: mbox IRQ failed (%d)\n", status);
+        goto fail_pci0;
+    }
+    if ((status = pci_request_irq(dev, 4, NULL, bce_handle_dma_irq, dev, "bce_dma"))) {
+        pr_err("apple-bce: hard reinit: DMA IRQ failed (%d)\n", status);
+        goto fail_irq0;
+    }
+
+    /* --- Driver-level init (matches probe) --- */
+    bce_mailbox_init(&bce->mbox, bce->reg_mem_mb, bce->pci);
+    spin_lock_init(&bce->queues_lock);
+    ida_init(&bce->queue_ida);
+    bce->t2_state_unknown = false;
+
+    bce_timestamp_start(&bce->timestamp, true);
+
+    if ((status = bce_fw_version_handshake(bce))) {
+        pr_err("apple-bce: hard reinit: FW handshake failed (%d)\n", status);
+        goto fail_ts;
+    }
+    pr_info("apple-bce: hard reinit: handshake done\n");
+
+    if ((status = bce_create_command_queues(bce))) {
+        pr_err("apple-bce: hard reinit: command queues failed (%d)\n", status);
+        goto fail_ts;
+    }
+
+    bce_vhci_create(bce, &bce->vhci);
+
+    pr_info("apple-bce: hard reinit: complete\n");
+    return 0;
+
+fail_ts:
+    bce_timestamp_stop(&bce->timestamp, bce->pci);
+    pci_free_irq(dev, 4, dev);
+fail_irq0:
+    pci_free_irq(dev, 0, dev);
+fail_pci0:
+#ifndef WITHOUT_NVME_PATCH
+    pci_disable_device(bce->pci0);
+#endif
+fail_msi:
+    pci_free_irq_vectors(dev);
+fail_disable:
+    pci_disable_device(dev);
     return status;
 }
 
 static int apple_bce_suspend(struct device *dev)
 {
-    struct apple_bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
+    struct pci_dev *pdev = to_pci_dev(dev);
+    struct apple_bce_device *bce = pci_get_drvdata(pdev);
+
+    pr_info("apple-bce: suspend: full teardown to match stub state\n");
+
+    /*
+     * Full teardown — make the device look identical to the stub driver
+     * (just claimed, nothing else). is_being_removed stays true through
+     * the entire sequence so all destroy paths skip T2 commands.
+     *
+     * After this, pci_pm_suspend_noirq sees a disabled device with no
+     * MSI/IRQs/bus-master — identical to an unbound device. PCI core
+     * saves clean state and handles D3 transition naturally.
+     */
+    bce->is_being_removed = true;
+
+    /* 1. Destroy VHCI — removes USB HCD, drains workqueue, frees all
+     *    event + message queues and their DMA buffers */
+    bce_vhci_destroy(&bce->vhci);
+
+    /* 2. Stop timestamp timer — no more periodic MMIO writes */
+    bce_timestamp_stop(&bce->timestamp, bce->pci);
+
+    /* 3. Free command queues — DMA buffers freed, no T2 unregister */
+    bce_free_command_queues(bce);
+
+    /* 4. Free IRQ handlers — no more interrupt processing */
+    pci_free_irq(pdev, 0, pdev);
+    pci_free_irq(pdev, 4, pdev);
+
+    /* 5. Free MSI vectors — PCI core won't snapshot stale MSI config */
+    pci_free_irq_vectors(pdev);
+
+    /* 6. Clear bus master — no more DMA from this device */
+    pci_clear_master(pdev);
+#ifndef WITHOUT_NVME_PATCH
+    pci_clear_master(bce->pci0);
+    pci_disable_device(bce->pci0);
+#endif
+
+    /* 7. Disable device — matches the fully quiesced stub state */
+    pci_disable_device(pdev);
+
+    /* Do NOT call pci_save_state/pci_prepare_to_sleep — let PCI core
+     * handle everything in suspend_noirq on this clean device.
+     * Do NOT free iomaps, regions, bce struct, or sysfs — keep for reinit. */
+
+    pr_info("apple-bce: suspend: teardown complete\n");
+    return 0;
+}
+
+static void bce_deferred_reinit_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(bce_reinit_dwork, bce_deferred_reinit_work);
+
+static void bce_deferred_reinit_work(struct work_struct *work)
+{
     int status;
 
-    bce_timestamp_stop(&bce->timestamp);
+    if (!global_bce)
+        return;
 
-    if ((status = bce_save_state_and_sleep(bce)))
-        return status;
-
-    return 0;
+    pr_info("apple-bce: deferred reinit: starting (200ms after resume)\n");
+    status = apple_bce_hard_reinit(global_bce);
+    if (status)
+        pr_err("apple-bce: deferred reinit: FAILED (%d)\n", status);
+    else
+        pr_info("apple-bce: deferred reinit: complete\n");
 }
 
 static int apple_bce_resume(struct device *dev)
 {
-    struct apple_bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
-    int status;
-
-    pci_set_master(bce->pci);
-    pci_set_master(bce->pci0);
-
-    if ((status = bce_restore_state_and_wake(bce)))
-        return status;
-
-    bce_timestamp_start(&bce->timestamp, false);
-
+    /* Schedule reinit 200ms after resume completes — late enough that
+     * all PCI devices are restored and the T2 PCIe endpoint is ready,
+     * but fast enough the user barely notices. */
+    pr_info("apple-bce: resume: scheduling deferred reinit (200ms)\n");
+    schedule_delayed_work(&bce_reinit_dwork, msecs_to_jiffies(200));
     return 0;
 }
 
@@ -376,7 +619,7 @@ static struct pci_device_id apple_bce_ids[  ] = {
 MODULE_DEVICE_TABLE(pci, apple_bce_ids);
 
 struct dev_pm_ops apple_bce_pci_driver_pm = {
-        .suspend = apple_bce_suspend,
+        .prepare = apple_bce_suspend,
         .resume = apple_bce_resume
 };
 struct pci_driver apple_bce_pci_driver = {
@@ -413,7 +656,8 @@ static int __init apple_bce_module_init(void)
     if (result)
         goto fail_drv;
 
-    aaudio_module_init();
+    /* aaudio disabled for suspend debugging */
+    /* aaudio_module_init(); */
 
     return 0;
 
@@ -431,11 +675,212 @@ static void __exit apple_bce_module_exit(void)
 {
     pci_unregister_driver(&apple_bce_pci_driver);
 
-    aaudio_module_exit();
+    /* aaudio_module_exit(); */
     bce_vhci_module_exit();
     class_destroy(bce_class);
     unregister_chrdev_region(bce_chrdev, 1);
 }
+
+/* DIAG: trigger SAVE_STATE_AND_SLEEP from userspace without actual suspend.
+ * Write "1" to /sys/module/apple_bce/parameters/test_t2_sleep
+ * Write "2" to send RESTORE_STATE_AND_WAKE (or RESTORE_NO_STATE) afterwards */
+static int test_t2_sleep_set(const char *val, const struct kernel_param *kp)
+{
+    int cmd;
+    if (kstrtoint(val, 10, &cmd))
+        return -EINVAL;
+    if (!global_bce) {
+        pr_err("apple-bce: test: no device\n");
+        return -ENODEV;
+    }
+    /* cmd=99: Full hard re-init (post-resume re-enumeration) */
+    if (cmd == 99) {
+        int status;
+        pr_info("apple-bce: sysfs: triggering hard reinit\n");
+        status = apple_bce_hard_reinit(global_bce);
+        pr_info("apple-bce: sysfs: hard reinit returned %d\n", status);
+        return status;
+
+    /* Quick fire: send 0x14 only, return immediately */
+    } else if (cmd == 1) {
+        pr_emerg("apple-bce: FIRE 0x14 (SLEEP_NO_STATE)\n");
+        bce_mailbox_send_noreply(&global_bce->mbox,
+                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0));
+        return 0;
+    /* Quick fire: send 0x15 only, return immediately */
+    } else if (cmd == 2) {
+        int status;
+        u64 resp;
+        pr_emerg("apple-bce: FIRE 0x15 (RESTORE_NO_STATE)\n");
+        status = bce_mailbox_send(&global_bce->mbox,
+                BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp);
+        if (!status)
+            pr_emerg("apple-bce: 0x15 reply type=0x%x value=0x%llx\n",
+                     BCE_MB_TYPE(resp), BCE_MB_VALUE(resp));
+        else
+            pr_emerg("apple-bce: 0x15 failed (%d)\n", status);
+        return 0;
+    /* Listen for 10s */
+    } else if (cmd == 3) {
+        int status, i;
+        u64 msg;
+        pr_emerg("apple-bce: LISTEN 10s\n");
+        for (i = 0; i < 2; i++) {
+            status = bce_mailbox_wait_unsolicited(&global_bce->mbox, &msg, 5000);
+            if (!status)
+                pr_emerg("apple-bce: GOT MESSAGE type=0x%x value=0x%llx raw=0x%llx\n",
+                         BCE_MB_TYPE(msg), BCE_MB_VALUE(msg), msg);
+            else
+                pr_emerg("apple-bce: timeout\n");
+        }
+        return 0;
+
+    /* Test A (cmd=10): Write SMC keys, then listen for unsolicited T2 messages */
+    } else if (cmd == 10) {
+        int status, i;
+        u64 msg;
+        pr_emerg("apple-bce: TEST A: write SMC keys, then listen for T2\n");
+        status = applesmc_t2_prepare_sleep();
+        pr_emerg("apple-bce: TEST A: SMC sleep prep returned %d\n", status);
+        if (status)
+            return status;
+        /* Listen for up to 30 seconds in 5-second intervals */
+        for (i = 0; i < 6; i++) {
+            pr_emerg("apple-bce: TEST A: listening for T2 message (%d/6, 5s)...\n", i + 1);
+            status = bce_mailbox_wait_unsolicited(&global_bce->mbox, &msg, 5000);
+            if (!status) {
+                pr_emerg("apple-bce: TEST A: GOT MESSAGE type=0x%x value=0x%llx raw=0x%llx\n",
+                         BCE_MB_TYPE(msg), BCE_MB_VALUE(msg), msg);
+            } else {
+                pr_emerg("apple-bce: TEST A: timeout (%d)\n", status);
+            }
+        }
+        pr_emerg("apple-bce: TEST A: done listening, sending SMC wake keys\n");
+        applesmc_t2_prepare_wake();
+        return 0;
+
+    /* Test B (cmd=11): Send 0x14, then listen for T2 response */
+    } else if (cmd == 11) {
+        int status, i;
+        u64 msg;
+        pr_emerg("apple-bce: TEST B: send 0x14, then listen for T2\n");
+        status = bce_mailbox_send_noreply(&global_bce->mbox,
+                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0));
+        pr_emerg("apple-bce: TEST B: sent 0x14, status=%d\n", status);
+        for (i = 0; i < 6; i++) {
+            pr_emerg("apple-bce: TEST B: listening (%d/6, 5s)...\n", i + 1);
+            status = bce_mailbox_wait_unsolicited(&global_bce->mbox, &msg, 5000);
+            if (!status) {
+                pr_emerg("apple-bce: TEST B: GOT MESSAGE type=0x%x value=0x%llx raw=0x%llx\n",
+                         BCE_MB_TYPE(msg), BCE_MB_VALUE(msg), msg);
+            } else {
+                pr_emerg("apple-bce: TEST B: timeout (%d)\n", status);
+            }
+        }
+        return 0;
+
+    /* Test C (cmd=12): SMC keys + 0x14, listen, then send 0x1A ACK */
+    } else if (cmd == 12) {
+        int status, i;
+        u64 msg;
+        pr_emerg("apple-bce: TEST C: SMC keys + 0x14, listen, ACK\n");
+        status = applesmc_t2_prepare_sleep();
+        pr_emerg("apple-bce: TEST C: SMC sleep prep returned %d\n", status);
+        status = bce_mailbox_send_noreply(&global_bce->mbox,
+                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0));
+        pr_emerg("apple-bce: TEST C: sent 0x14, status=%d\n", status);
+        /* Listen for T2's 0x17 response */
+        for (i = 0; i < 6; i++) {
+            pr_emerg("apple-bce: TEST C: listening (%d/6, 5s)...\n", i + 1);
+            status = bce_mailbox_wait_unsolicited(&global_bce->mbox, &msg, 5000);
+            if (!status) {
+                pr_emerg("apple-bce: TEST C: GOT MESSAGE type=0x%x value=0x%llx raw=0x%llx\n",
+                         BCE_MB_TYPE(msg), BCE_MB_VALUE(msg), msg);
+                /* If we got 0x17, send ACK (0x1A) */
+                if (BCE_MB_TYPE(msg) == BCE_MB_SAVE_STATE_AND_SLEEP) {
+                    pr_emerg("apple-bce: TEST C: got 0x17! Sending 0x1A ACK\n");
+                    bce_mailbox_send_noreply(&global_bce->mbox,
+                            BCE_MB_MSG(BCE_MB_SAVE_RESTORE_STATE_COMPLETE, 0));
+                }
+                break;
+            }
+            pr_emerg("apple-bce: TEST C: timeout (%d)\n", status);
+        }
+        /* Wait a bit then wake */
+        pr_emerg("apple-bce: TEST C: sending SMC wake keys\n");
+        applesmc_t2_prepare_wake();
+        return 0;
+
+    /* Test D (cmd=20): Send 0x14 synchronously — see if T2 replies */
+    } else if (cmd == 20) {
+        int status;
+        u64 resp;
+        pr_emerg("apple-bce: TEST D: send 0x14 synchronously (wait for reply)\n");
+        status = bce_mailbox_send(&global_bce->mbox,
+                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0), &resp);
+        if (!status)
+            pr_emerg("apple-bce: TEST D: T2 replied type=0x%x value=0x%llx raw=0x%llx\n",
+                     BCE_MB_TYPE(resp), BCE_MB_VALUE(resp), resp);
+        else
+            pr_emerg("apple-bce: TEST D: no reply (status=%d)\n", status);
+        return 0;
+
+    /* Test E (cmd=21): 0x14 fire-forget, 2s wait, then 0x15 (RESTORE_NO_STATE) to recover */
+    } else if (cmd == 21) {
+        int status;
+        u64 resp;
+        pr_emerg("apple-bce: TEST E: 0x14 then recover with 0x15\n");
+        bce_mailbox_send_noreply(&global_bce->mbox,
+                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0));
+        pr_emerg("apple-bce: TEST E: 0x14 sent, waiting 2s...\n");
+        msleep(2000);
+        pr_emerg("apple-bce: TEST E: sending 0x15 (RESTORE_NO_STATE)\n");
+        status = bce_mailbox_send(&global_bce->mbox,
+                BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp);
+        if (!status)
+            pr_emerg("apple-bce: TEST E: T2 replied type=0x%x value=0x%llx raw=0x%llx\n",
+                     BCE_MB_TYPE(resp), BCE_MB_VALUE(resp), resp);
+        else
+            pr_emerg("apple-bce: TEST E: no reply (status=%d)\n", status);
+        return 0;
+
+    /* Test F (cmd=22): SMC keys + 0x14, listen 10s, then 0x15 recover + SMC wake */
+    } else if (cmd == 22) {
+        int status, i;
+        u64 resp, msg;
+        pr_emerg("apple-bce: TEST F: SMC + 0x14, listen, then 0x15 recover\n");
+        applesmc_t2_prepare_sleep();
+        pr_emerg("apple-bce: TEST F: SMC keys written\n");
+        bce_mailbox_send_noreply(&global_bce->mbox,
+                BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0));
+        pr_emerg("apple-bce: TEST F: 0x14 sent, listening 10s...\n");
+        for (i = 0; i < 2; i++) {
+            status = bce_mailbox_wait_unsolicited(&global_bce->mbox, &msg, 5000);
+            if (!status)
+                pr_emerg("apple-bce: TEST F: GOT MESSAGE type=0x%x value=0x%llx raw=0x%llx\n",
+                         BCE_MB_TYPE(msg), BCE_MB_VALUE(msg), msg);
+            else
+                pr_emerg("apple-bce: TEST F: timeout (%d)\n", status);
+        }
+        pr_emerg("apple-bce: TEST F: sending 0x15 (RESTORE_NO_STATE)\n");
+        status = bce_mailbox_send(&global_bce->mbox,
+                BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp);
+        if (!status)
+            pr_emerg("apple-bce: TEST F: T2 replied type=0x%x value=0x%llx raw=0x%llx\n",
+                     BCE_MB_TYPE(resp), BCE_MB_VALUE(resp), resp);
+        else
+            pr_emerg("apple-bce: TEST F: 0x15 no reply (status=%d)\n", status);
+        applesmc_t2_prepare_wake();
+        pr_emerg("apple-bce: TEST F: done\n");
+        return 0;
+    }
+    return -EINVAL;
+}
+static const struct kernel_param_ops test_t2_sleep_ops = {
+    .set = test_t2_sleep_set,
+};
+module_param_cb(test_t2_sleep, &test_t2_sleep_ops, NULL, 0200);
+MODULE_PARM_DESC(test_t2_sleep, "20=D(0x14 sync), 21=E(0x14+0x15 recover), 22=F(SMC+0x14+0x15)");
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("MrARM");

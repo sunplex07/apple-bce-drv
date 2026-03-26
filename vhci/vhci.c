@@ -73,6 +73,10 @@ fail_dev:
 void bce_vhci_destroy(struct bce_vhci *vhci)
 {
     usb_remove_hcd(vhci->hcd);
+    if (vhci->tq_state_wq) {
+        destroy_workqueue(vhci->tq_state_wq);
+        vhci->tq_state_wq = NULL;
+    }
     bce_vhci_destroy_event_queues(vhci);
     bce_vhci_destroy_message_queues(vhci);
     device_destroy(bce_vhci_class, vhci->vdevt);
@@ -101,6 +105,14 @@ int bce_vhci_start(struct usb_hcd *hcd)
         port_mask >>= 1;
     }
     vhci->port_count = port_no;
+
+    /* Query initial controllerToken — used to detect T2 reboot on resume.
+     * Non-fatal if this fails (old T2 firmware may not support it). */
+    if (bce_vhci_cmd_controller_token(&vhci->cq, &vhci->controller_token))
+        pr_warn("bce_vhci: failed to query initial controllerToken\n");
+    else
+        pr_info("bce_vhci: controllerToken 0x%016llx\n", vhci->controller_token);
+
     return 0;
 }
 
@@ -389,7 +401,21 @@ static int bce_vhci_bus_resume(struct usb_hcd *hcd)
 {
     int i, j;
     int status;
+    u64 new_token;
+    bool token_mismatch = false;
     struct bce_vhci *vhci = bce_vhci_from_hcd(hcd);
+
+    /* After S3 with no state restore, all queues/endpoints are stale.
+     * Skip all T2 commands — they'd hang on dead command queues.
+     * Tell USB core the hub lost power so it cleanly disconnects
+     * all devices, then T2 re-enumerates on its own. */
+    if (vhci->dev->t2_state_unknown) {
+        pr_warn("bce_vhci: resume: T2 state unknown, signalling hub power loss\n");
+        usb_root_hub_lost_power(hcd->self.root_hub);
+        pr_info("bce_vhci: resume: skipping stale queue operations\n");
+        return 0;
+    }
+
     pr_info("bce_vhci: resume started\n");
 
     bce_vhci_event_queue_resume(&vhci->ev_system);
@@ -401,6 +427,24 @@ static int bce_vhci_bus_resume(struct usb_hcd *hcd)
     pr_info("bce_vhci: resume controller\n");
     if ((status = bce_vhci_cmd_controller_start(&vhci->cq)))
         return status;
+
+    /* controllerToken check: detect T2 reboot during sleep. */
+    if (bce_vhci_cmd_controller_token(&vhci->cq, &new_token)) {
+        pr_err("bce_vhci: controllerToken command failed — assuming T2 rebooted\n");
+        token_mismatch = true;
+    } else if (new_token != vhci->controller_token) {
+        pr_warn("bce_vhci: controllerToken 0x%016llx -> 0x%016llx, controller mismatch\n",
+                vhci->controller_token, new_token);
+        vhci->controller_token = new_token;
+        token_mismatch = true;
+    } else {
+        pr_info("bce_vhci: controllerToken 0x%016llx matches\n", new_token);
+    }
+
+    if (token_mismatch) {
+        pr_warn("bce_vhci: T2 rebooted during sleep, triggering USB re-enumeration\n");
+        usb_root_hub_lost_power(hcd->self.root_hub);
+    }
 
     pr_info("bce_vhci: resume ports\n");
     for (i = 0; i < 16; i++) {

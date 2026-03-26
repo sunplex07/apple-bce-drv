@@ -19,6 +19,7 @@ enum bce_vhci_command {
     BCE_VHCI_CMD_CONTROLLER_DISABLE = 2,
     BCE_VHCI_CMD_CONTROLLER_START = 3,
     BCE_VHCI_CMD_CONTROLLER_PAUSE = 4,
+    BCE_VHCI_CMD_CONTROLLER_TOKEN = 5,  /* session token — detects T2 reboot */
 
     BCE_VHCI_CMD_PORT_POWER_ON = 0x10,
     BCE_VHCI_CMD_PORT_POWER_OFF = 0x11,
@@ -58,6 +59,23 @@ static inline int bce_vhci_cmd_controller_enable(struct bce_vhci_command_queue *
     status = bce_vhci_command_queue_execute(q, &cmd, &res, BCE_VHCI_CMD_TIMEOUT_LONG);
     if (!status)
         *portMask = (u16) res.param2;
+    return status;
+}
+/* controllerToken: returns 64-bit session token from T2.
+ * Changes across sleep/wake mean T2 rebooted — all VHCI state is invalid.
+ * Verified from macOS disassembly at 0xffffff8002e65f94: opcode=5, timeout=2000ms,
+ * token returned in VHCIMessage data field (offset 8, mapped to param2). */
+static inline int bce_vhci_cmd_controller_token(struct bce_vhci_command_queue *q, u64 *token)
+{
+    int status;
+    struct bce_vhci_message cmd, res;
+    cmd.cmd = BCE_VHCI_CMD_CONTROLLER_TOKEN;
+    cmd.status = 0;
+    cmd.param1 = 0;
+    cmd.param2 = 0;
+    status = bce_vhci_command_queue_execute(q, &cmd, &res, BCE_VHCI_CMD_TIMEOUT_SHORT);
+    if (!status)
+        *token = res.param2;
     return status;
 }
 static inline int bce_vhci_cmd_controller_disable(struct bce_vhci_command_queue *q)

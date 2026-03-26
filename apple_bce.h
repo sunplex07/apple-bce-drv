@@ -28,6 +28,7 @@ struct apple_bce_device {
     struct bce_queue_cmdq *cmd_cmdq;
     struct bce_queue_sq *int_sq_list[BCE_MAX_QUEUE_COUNT];
     bool is_being_removed;
+    bool t2_state_unknown;  /* set after no-op suspend — skip T2 commands */
 
     dma_addr_t saved_data_dma_addr;
     void *saved_data_dma_ptr;

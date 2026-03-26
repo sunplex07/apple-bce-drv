@@ -257,10 +257,13 @@ static __always_inline void *bce_cmd_start(struct bce_queue_cmdq *cmdq, struct b
 
 static __always_inline void bce_cmd_finish(struct bce_queue_cmdq *cmdq, struct bce_queue_cmdq_result_el *res)
 {
+    unsigned long timeout;
     bce_submit_to_device(cmdq->sq);
     spin_unlock(&cmdq->lck);
 
-    wait_for_completion(&res->cmpl);
+    timeout = wait_for_completion_timeout(&res->cmpl, msecs_to_jiffies(3000));
+    if (!timeout)
+        pr_err("apple-bce: cmd_finish: timeout waiting for T2 reply\n");
     mb();
 }
 
@@ -285,7 +288,17 @@ u32 bce_cmd_register_queue(struct bce_queue_cmdq *cmdq, struct bce_queue_memcfg 
     cmd->addr = cfg->addr;
     cmd->length = cfg->length;
 
+    pr_info("apple-bce: register_queue: qid=%d el_count=%d vec_or_cq=%d flags=0x%x "
+            "addr=0x%llx len=0x%x name=%s dirout=%d\n",
+            cfg->qid, cfg->el_count, cfg->vector_or_cq, cmd->flags,
+            cfg->addr, cfg->length, name ? name : "(null)", isdirout);
+
     bce_cmd_finish(cmdq, &res);
+
+    if (res.status)
+        pr_err("apple-bce: register_queue: qid=%d FAILED status=%u\n",
+               cfg->qid, res.status);
+
     return res.status;
 }
 
@@ -386,30 +399,26 @@ struct bce_queue_sq *bce_create_sq(struct apple_bce_device *dev, struct bce_queu
 
 void bce_destroy_cq(struct apple_bce_device *dev, struct bce_queue_cq *cq)
 {
-    if (!dev->is_being_removed && bce_cmd_unregister_memory_queue(dev->cmd_cmdq, (u16) cq->qid))
-        pr_err("apple-bce: CQ unregister failed");
+    bool skip_hw = dev->is_being_removed || dev->t2_state_unknown;
+    if (!skip_hw && bce_cmd_unregister_memory_queue(dev->cmd_cmdq, (u16) cq->qid))
+        pr_warn("apple-bce: CQ %d unregister failed\n", cq->qid);
     spin_lock(&dev->queues_lock);
     dev->queues[cq->qid] = NULL;
     spin_unlock(&dev->queues_lock);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
-    ida_simple_remove(&dev->queue_ida, (uint) cq->qid);
-#else
-    ida_free(&dev->queue_ida, (uint) cq->qid);
-#endif
+    if (!skip_hw)
+        ida_free(&dev->queue_ida, (uint) cq->qid);
     bce_free_cq(dev, cq);
 }
 
 void bce_destroy_sq(struct apple_bce_device *dev, struct bce_queue_sq *sq)
 {
-    if (!dev->is_being_removed && bce_cmd_unregister_memory_queue(dev->cmd_cmdq, (u16) sq->qid))
-        pr_err("apple-bce: CQ unregister failed");
+    bool skip_hw = dev->is_being_removed || dev->t2_state_unknown;
+    if (!skip_hw && bce_cmd_unregister_memory_queue(dev->cmd_cmdq, (u16) sq->qid))
+        pr_warn("apple-bce: SQ %d unregister failed\n", sq->qid);
     spin_lock(&dev->queues_lock);
     dev->queues[sq->qid] = NULL;
     spin_unlock(&dev->queues_lock);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
-    ida_simple_remove(&dev->queue_ida, (uint) sq->qid);
-#else
-    ida_free(&dev->queue_ida, (uint) sq->qid);
-#endif
+    if (!skip_hw)
+        ida_free(&dev->queue_ida, (uint) sq->qid);
     bce_free_sq(dev, sq);
 }
