@@ -29,6 +29,7 @@ void bce_vhci_create_transfer_queue(struct bce_vhci *vhci, struct bce_vhci_trans
     q->state = BCE_VHCI_ENDPOINT_ACTIVE;
     q->active = true;
     q->stalled = false;
+    q->paused_by = 0;
     q->max_active_requests = 1;
     if (usb_endpoint_type(&endp->desc) == USB_ENDPOINT_XFER_BULK)
         q->max_active_requests = BCE_VHCI_BULK_MAX_ACTIVE_URBS;
