@@ -15,6 +15,7 @@ static char *aaudio_alsa_id = SNDRV_DEFAULT_STR1;
 
 static dev_t aaudio_chrdev;
 static struct class *aaudio_class;
+struct aaudio_device *global_aaudio;
 
 static int aaudio_init_cmd(struct aaudio_device *a);
 static int aaudio_init_bs(struct aaudio_device *a);
@@ -129,6 +130,7 @@ static int aaudio_probe(struct pci_dev *dev, const struct pci_device_id *id)
         }
     }
 
+    global_aaudio = aaudio;
     return 0;
 
 fail_snd:
@@ -158,6 +160,9 @@ static void aaudio_remove(struct pci_dev *dev)
     struct aaudio_subdevice *sdev;
     struct aaudio_device *aaudio = pci_get_drvdata(dev);
 
+    global_aaudio = NULL;
+    aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_OFF);
+    aaudio_bce_destroy(aaudio);
     snd_card_free(aaudio->card);
     while (!list_empty(&aaudio->subdevice_list)) {
         sdev = list_first_entry(&aaudio->subdevice_list, struct aaudio_subdevice, list);
@@ -175,15 +180,87 @@ static void aaudio_remove(struct pci_dev *dev)
 
 static int aaudio_suspend(struct device *dev)
 {
-    /* DIAG: no-op suspend to isolate panic source */
-    pr_info("aaudio: suspend: NO-OP (diagnostic mode)\n");
+    /* No-op — apple-bce manages our lifecycle via aaudio_suspend_teardown */
     return 0;
 }
 
 static int aaudio_resume(struct device *dev)
 {
-    /* DIAG: no-op resume to match no-op suspend */
-    pr_info("aaudio: resume: NO-OP (diagnostic mode)\n");
+    /* No-op — apple-bce manages our lifecycle via aaudio_resume_reinit */
+    return 0;
+}
+
+void aaudio_suspend_teardown(void)
+{
+    struct aaudio_device *aaudio = global_aaudio;
+    if (!aaudio)
+        return;
+
+    pr_info("aaudio: suspend teardown: starting\n");
+
+    /* Tell T2 audio to stop */
+    aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_OFF);
+
+    /* Destroy BCE queues + DMA buffers */
+    aaudio_bce_destroy(aaudio);
+
+    /* Disable PCI */
+    pci_disable_device(aaudio->pci);
+
+    pr_info("aaudio: suspend teardown: complete\n");
+}
+
+int aaudio_resume_reinit(void)
+{
+    struct aaudio_device *aaudio = global_aaudio;
+    int status;
+    u32 ver, sig;
+
+    if (!aaudio)
+        return 0;
+
+    pr_info("aaudio: resume reinit: starting\n");
+
+    if ((status = pci_enable_device(aaudio->pci))) {
+        pr_err("aaudio: resume reinit: pci_enable_device failed (%d)\n", status);
+        return status;
+    }
+    pci_set_master(aaudio->pci);
+
+    /* Verify GPR state survived — if T2 rebooted, these are garbage */
+    ver = ioread32(&aaudio->reg_mem_gpr[0]);
+    sig = ioread32(&aaudio->reg_mem_gpr[1]);
+    if (ver < 3 || sig != AAUDIO_SIG) {
+        pr_err("aaudio: resume reinit: GPR state lost (ver=%u sig=0x%x)\n", ver, sig);
+        return -EIO;
+    }
+
+    /* Recreate BCE queues */
+    if ((status = aaudio_bce_init(aaudio))) {
+        pr_err("aaudio: resume reinit: bce_init failed (%d)\n", status);
+        return status;
+    }
+
+    /* Re-handshake with T2 audio */
+    reinit_completion(&aaudio->remote_alive);
+    if ((status = aaudio_init_cmd(aaudio))) {
+        pr_err("aaudio: resume reinit: init_cmd failed (%d)\n", status);
+        return status;
+    }
+
+    /* Reinit buffer struct from T2 shared memory */
+    if ((status = aaudio_init_bs(aaudio))) {
+        pr_err("aaudio: resume reinit: init_bs failed (%d)\n", status);
+        return status;
+    }
+
+    /* Re-enable remote access */
+    if ((status = aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_ON))) {
+        pr_err("aaudio: resume reinit: set_remote_access failed (%d)\n", status);
+        return status;
+    }
+
+    pr_info("aaudio: resume reinit: complete\n");
     return 0;
 }
 

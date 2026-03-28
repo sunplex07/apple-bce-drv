@@ -120,6 +120,11 @@ void aaudio_handle_command(struct aaudio_device *a, struct aaudio_msg *msg);
 int aaudio_module_init(void);
 void aaudio_module_exit(void);
 
+void aaudio_suspend_teardown(void);
+int aaudio_resume_reinit(void);
+
+extern struct aaudio_device *global_aaudio;
+
 extern struct aaudio_alsa_pcm_id_mapping aaudio_alsa_id_mappings[];
 
 #endif //AAUDIO_H

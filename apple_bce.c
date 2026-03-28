@@ -96,16 +96,6 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
         goto fail_ts;
     pr_info("apple-bce: handshake done\n");
 
-    {
-        u64 resp;
-        pr_info("apple-bce: sending RESTORE_NO_STATE (0x15)\n");
-        status = bce_mailbox_send(&bce->mbox, BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp);
-        if (status)
-            pr_err("apple-bce: RESTORE_NO_STATE failed (%d)\n", status);
-        else
-            pr_info("apple-bce: RESTORE_NO_STATE OK (type=0x%x)\n", BCE_MB_TYPE(resp));
-    }
-
     if ((status = bce_create_command_queues(bce))) {
         pr_info("apple-bce: Creating command queues failed\n");
         goto fail_ts;
@@ -511,16 +501,6 @@ static int apple_bce_hard_reinit(struct apple_bce_device *bce)
     }
     pr_info("apple-bce: hard reinit: handshake done\n");
 
-    {
-        u64 resp;
-        pr_info("apple-bce: hard reinit: sending RESTORE_NO_STATE (0x15)\n");
-        status = bce_mailbox_send(&bce->mbox, BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp);
-        if (status)
-            pr_err("apple-bce: hard reinit: RESTORE_NO_STATE failed (%d)\n", status);
-        else
-            pr_info("apple-bce: hard reinit: RESTORE_NO_STATE OK (type=0x%x)\n", BCE_MB_TYPE(resp));
-    }
-
     if ((status = bce_create_command_queues(bce))) {
         pr_err("apple-bce: hard reinit: command queues failed (%d)\n", status);
         goto fail_ts;
@@ -551,6 +531,9 @@ static int apple_bce_suspend(struct device *dev)
 {
     struct pci_dev *pdev = to_pci_dev(dev);
     struct apple_bce_device *bce = pci_get_drvdata(pdev);
+
+    /* Tear down aaudio first — it depends on our BCE queues */
+    aaudio_suspend_teardown();
 
     pr_info("apple-bce: suspend: full teardown to match stub state\n");
 
@@ -614,8 +597,15 @@ static void bce_deferred_reinit_work(struct work_struct *work)
     status = apple_bce_hard_reinit(global_bce);
     if (status)
         pr_err("apple-bce: deferred reinit: FAILED (%d)\n", status);
-    else
+    else {
         pr_info("apple-bce: deferred reinit: complete\n");
+
+        /* Reinit aaudio after BCE is ready */
+        msleep(100);
+        status = aaudio_resume_reinit();
+        if (status)
+            pr_err("apple-bce: deferred reinit: aaudio reinit FAILED (%d)\n", status);
+    }
 }
 
 static int apple_bce_resume(struct device *dev)
@@ -674,7 +664,7 @@ static int __init apple_bce_module_init(void)
         goto fail_drv;
 
     /* aaudio disabled for suspend debugging */
-    /* aaudio_module_init(); */
+    aaudio_module_init();
 
     return 0;
 
@@ -692,7 +682,7 @@ static void __exit apple_bce_module_exit(void)
 {
     pci_unregister_driver(&apple_bce_pci_driver);
 
-    /* aaudio_module_exit(); */
+    aaudio_module_exit();
     bce_vhci_module_exit();
     class_destroy(bce_class);
     unregister_chrdev_region(bce_chrdev, 1);
