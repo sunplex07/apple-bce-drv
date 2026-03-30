@@ -39,6 +39,7 @@ struct bce_vhci {
     struct workqueue_struct *tq_state_wq;
     struct work_struct w_fw_events;
     unsigned long port_change_pending;
+    struct delayed_work port_work;
 };
 
 int __init bce_vhci_module_init(void);

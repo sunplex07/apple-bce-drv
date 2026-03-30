@@ -5,6 +5,7 @@
 #include <linux/usb/hcd.h>
 #include <linux/module.h>
 #include <linux/version.h>
+#include <linux/workqueue.h>
 
 static dev_t bce_vhci_chrdev;
 static struct class *bce_vhci_class;
@@ -18,11 +19,20 @@ static void bce_vhci_destroy_message_queues(struct bce_vhci *vhci);
 static void bce_vhci_handle_firmware_events_w(struct work_struct *ws);
 static void bce_vhci_firmware_event_completion(struct bce_queue_sq *sq);
 
+static void bce_vhci_port_work(struct work_struct *work)
+{
+    struct bce_vhci *vhci = container_of(to_delayed_work(work),
+                                          struct bce_vhci, port_work);
+    if (vhci->hcd)
+        usb_hcd_poll_rh_status(vhci->hcd);
+}
+
 int bce_vhci_create(struct apple_bce_device *dev, struct bce_vhci *vhci)
 {
     int status;
 
     spin_lock_init(&vhci->hcd_spinlock);
+    INIT_DELAYED_WORK(&vhci->port_work, bce_vhci_port_work);
 
     vhci->dev = dev;
 
@@ -72,6 +82,7 @@ fail_dev:
 
 void bce_vhci_destroy(struct bce_vhci *vhci)
 {
+    cancel_delayed_work_sync(&vhci->port_work);
     usb_remove_hcd(vhci->hcd);
     if (vhci->tq_state_wq) {
         destroy_workqueue(vhci->tq_state_wq);
@@ -738,10 +749,15 @@ static void bce_vhci_handle_system_event(struct bce_vhci_event_queue *q, struct 
          * tell the USB framework to re-scan so late-initializing devices
          * (camera, Touch Bar, iBridge) are discovered. */
         if (hcd) {
-            pr_warn("bce-vhci: Port %u status change event, requesting hub rescan\n",
-                                msg->param1);
+            pr_info("bce-vhci: Port %u status change event\n", msg->param1);
             set_bit(msg->param1, &q->vhci->port_change_pending);
-            usb_hcd_poll_rh_status(hcd);
+            /* Batch port changes — defer hub poll by 50ms so all ports
+             * from a burst of T2 events are reported together. This
+             * ensures port 7 (backlight) and port 6 (Touch Bar) enumerate
+             * in the same hub scan pass, so hid-appletb-bl probes before
+             * hid-appletb-kbd looks for the backlight device. */
+            mod_delayed_work(system_wq, &q->vhci->port_work,
+                             msecs_to_jiffies(50));
         } else {
             pr_warn("bce-vhci: port %u change received but HCD is NULL\n",
                                 msg->param1);
