@@ -1,6 +1,7 @@
 #include "apple_bce.h"
 #include <linux/module.h>
 #include <linux/crc32.h>
+#include <linux/fs.h>
 #include "audio/audio.h"
 #include "vhci/command.h"
 #include <linux/version.h>
@@ -10,6 +11,45 @@ static dev_t bce_chrdev;
 static struct class *bce_class;
 
 struct apple_bce_device *global_bce;
+
+static bool send_restore_no_state = true;
+
+#define KBD_BL_PATH "/sys/class/leds/:white:kbd_backlight/brightness"
+
+static int saved_kbd_brightness = -1;
+
+static int bce_read_sysfs_int(const char *path)
+{
+    struct file *f;
+    char buf[16] = {};
+    int val = -1;
+    loff_t pos = 0;
+
+    f = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(f))
+        return -1;
+    kernel_read(f, buf, sizeof(buf) - 1, &pos);
+    filp_close(f, NULL);
+    if (kstrtoint(strim(buf), 10, &val))
+        return -1;
+    return val;
+}
+
+static void bce_write_sysfs_int(const char *path, int val)
+{
+    struct file *f;
+    char buf[16];
+    int len;
+    loff_t pos = 0;
+
+    f = filp_open(path, O_WRONLY, 0);
+    if (IS_ERR(f))
+        return;
+    len = snprintf(buf, sizeof(buf), "%d\n", val);
+    kernel_write(f, buf, len, &pos);
+    filp_close(f, NULL);
+}
+
 
 static int bce_create_command_queues(struct apple_bce_device *bce);
 static void bce_free_command_queues(struct apple_bce_device *bce);
@@ -95,6 +135,16 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
     if ((status = bce_fw_version_handshake(bce)))
         goto fail_ts;
     pr_info("apple-bce: handshake done\n");
+
+    if (send_restore_no_state) {
+        u64 resp;
+        if ((status = bce_mailbox_send(&bce->mbox,
+                BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp))) {
+            pr_err("apple-bce: probe: RESTORE_NO_STATE failed (%d)\n", status);
+            goto fail_ts;
+        }
+        pr_info("apple-bce: probe: RESTORE_NO_STATE OK\n");
+    }
 
     if ((status = bce_create_command_queues(bce))) {
         pr_info("apple-bce: Creating command queues failed\n");
@@ -501,6 +551,16 @@ static int apple_bce_hard_reinit(struct apple_bce_device *bce)
     }
     pr_info("apple-bce: hard reinit: handshake done\n");
 
+    if (send_restore_no_state) {
+        u64 resp;
+        if ((status = bce_mailbox_send(&bce->mbox,
+                BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp))) {
+            pr_err("apple-bce: hard reinit: RESTORE_NO_STATE failed (%d)\n", status);
+            goto fail_ts;
+        }
+        pr_info("apple-bce: hard reinit: RESTORE_NO_STATE OK\n");
+    }
+
     if ((status = bce_create_command_queues(bce))) {
         pr_err("apple-bce: hard reinit: command queues failed (%d)\n", status);
         goto fail_ts;
@@ -531,6 +591,11 @@ static int apple_bce_suspend(struct device *dev)
 {
     struct pci_dev *pdev = to_pci_dev(dev);
     struct apple_bce_device *bce = pci_get_drvdata(pdev);
+
+    /* Save keyboard backlight before teardown destroys USB devices.
+     * systemd-backlight handles most of this, but as a fallback we
+     * also save/restore via sysfs in case systemd isn't present. */
+    saved_kbd_brightness = bce_read_sysfs_int(KBD_BL_PATH);
 
     /* Tear down aaudio first — it depends on our BCE queues */
     aaudio_suspend_teardown();
@@ -605,6 +670,23 @@ static void bce_deferred_reinit_work(struct work_struct *work)
         status = aaudio_resume_reinit();
         if (status)
             pr_err("apple-bce: deferred reinit: aaudio reinit FAILED (%d)\n", status);
+
+        /* Wait for VHCI USB devices to finish enumerating, then flush
+         * logind's device cache. After VHCI rebuild, all input/LED devices
+         * get new sysfs paths. Logind caches old references — FlushDevices
+         * forces it to re-scan, which cascades to all DEs (GNOME, KDE, etc.)
+         * re-discovering keyboard backlight and input devices. */
+        msleep(1000);
+        if (saved_kbd_brightness > 0) {
+            bce_write_sysfs_int(KBD_BL_PATH, saved_kbd_brightness);
+            pr_info("apple-bce: restored kbd backlight: %d\n", saved_kbd_brightness);
+            saved_kbd_brightness = -1;
+        }
+        /* Backlight brightness restoration is handled by:
+         * 1. systemd-backlight@ service (auto-saves/restores via udev)
+         * 2. Sysfs fallback above (if brightness was > 0)
+         * 3. UPower restart via udev rule (99-apple-kbd-backlight.rules)
+         *    to force re-discovery of the new LED device after VHCI rebuild */
     }
 }
 
@@ -735,6 +817,9 @@ static const struct kernel_param_ops test_t2_sleep_ops = {
 };
 module_param_cb(test_t2_sleep, &test_t2_sleep_ops, NULL, 0200);
 MODULE_PARM_DESC(test_t2_sleep, "99=hard reinit, 1=send 0x14, 2=send 0x15");
+
+module_param(send_restore_no_state, bool, 0644);
+MODULE_PARM_DESC(send_restore_no_state, "Send RESTORE_NO_STATE (0x15) at probe and resume (default=1)");
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("MrARM");
