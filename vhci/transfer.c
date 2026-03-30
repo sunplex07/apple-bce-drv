@@ -186,12 +186,21 @@ int bce_vhci_transfer_queue_do_pause(struct bce_vhci_transfer_queue *q)
 {
     unsigned long flags;
     int status;
+    int tries;
     u8 endp_addr = (u8) (q->endp->desc.bEndpointAddress & 0x8F);
     spin_lock_irqsave(&q->urb_lock, flags);
     q->active = false;
     spin_unlock_irqrestore(&q->urb_lock, flags);
     if (q->sq_out) {
-        pr_err("bce-vhci: Not implemented: wait for pending output requests\n");
+        bce_cmd_flush_memory_queue(q->vhci->dev->cmd_cmdq, (u16) q->sq_out->qid);
+        for (tries = 0; tries < 50; tries++) {
+            if (q->remaining_active_requests >= q->max_active_requests)
+                break;
+            usleep_range(1000, 2000);
+        }
+        if (q->remaining_active_requests < q->max_active_requests)
+            pr_warn("bce-vhci: [%02x] %d output requests still in flight after flush\n",
+                    q->endp_addr, q->max_active_requests - q->remaining_active_requests);
     }
     bce_vhci_transfer_queue_remove_pending(q);
     if ((status = bce_vhci_cmd_endpoint_set_state(
