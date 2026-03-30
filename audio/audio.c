@@ -193,10 +193,21 @@ static int aaudio_resume(struct device *dev)
 void aaudio_suspend_teardown(void)
 {
     struct aaudio_device *aaudio = global_aaudio;
+    struct aaudio_subdevice *sdev;
+    int i;
     if (!aaudio)
         return;
 
     pr_info("aaudio: suspend teardown: starting\n");
+
+    /* Stop all active streams — clears started flag so pcm_pointer
+     * returns 0 instead of garbage from stale timestamps */
+    list_for_each_entry(sdev, &aaudio->subdevice_list, list) {
+        for (i = 0; i < sdev->out_stream_cnt; i++)
+            sdev->out_streams[i].started = 0;
+        for (i = 0; i < sdev->in_stream_cnt; i++)
+            sdev->in_streams[i].started = 0;
+    }
 
     /* Tell T2 audio to stop */
     aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_OFF);
@@ -208,6 +219,31 @@ void aaudio_suspend_teardown(void)
     pci_disable_device(aaudio->pci);
 
     pr_info("aaudio: suspend teardown: complete\n");
+}
+
+static void aaudio_free_stream_buffers(struct aaudio_device *a)
+{
+    struct aaudio_subdevice *sdev;
+    int i;
+
+    list_for_each_entry(sdev, &a->subdevice_list, list) {
+        for (i = 0; i < sdev->out_stream_cnt; i++) {
+            kfree(sdev->out_streams[i].buffers);
+            sdev->out_streams[i].buffers = NULL;
+            sdev->out_streams[i].buffer_cnt = 0;
+        }
+        for (i = 0; i < sdev->in_stream_cnt; i++) {
+            if (sdev->in_streams[i].buffers && sdev->in_streams[i].buffer_cnt > 0) {
+                struct aaudio_dma_buf *buf = &sdev->in_streams[i].buffers[0];
+                if (buf->ptr)
+                    dma_free_coherent(&a->pci->dev, buf->size,
+                                      buf->ptr, buf->dma_addr);
+            }
+            kfree(sdev->in_streams[i].buffers);
+            sdev->in_streams[i].buffers = NULL;
+            sdev->in_streams[i].buffer_cnt = 0;
+        }
+    }
 }
 
 int aaudio_resume_reinit(void)
@@ -241,14 +277,29 @@ int aaudio_resume_reinit(void)
         return status;
     }
 
-    /* Re-handshake with T2 audio */
+    /* T2 handshake — alive notification + wait.
+     * Do NOT call aaudio_init_cmd: it creates duplicate subdevices.
+     * Subdevice topology is stable across suspend — reuse from probe. */
     reinit_completion(&aaudio->remote_alive);
-    if ((status = aaudio_init_cmd(aaudio))) {
-        pr_err("aaudio: resume reinit: init_cmd failed (%d)\n", status);
-        return status;
+    {
+        struct aaudio_send_ctx sctx;
+        if ((status = aaudio_send(aaudio, &sctx, 500,
+                                  aaudio_msg_write_alive_notification, 1, 3))) {
+            pr_err("aaudio: resume reinit: alive notification failed (%d)\n", status);
+            return status;
+        }
+    }
+    if (wait_for_completion_timeout(&aaudio->remote_alive, msecs_to_jiffies(500)) == 0) {
+        pr_err("aaudio: resume reinit: T2 alive timeout\n");
+        return -ETIMEDOUT;
     }
 
-    /* Reinit buffer struct from T2 shared memory */
+    /* Free old stream buffers before re-reading BufferStruct.
+     * Output buffers: metadata only (MMIO pointers, not host-allocated).
+     * Input buffers: host DMA — must dma_free_coherent. */
+    aaudio_free_stream_buffers(aaudio);
+
+    /* Re-read BufferStruct from T2 shared memory */
     if ((status = aaudio_init_bs(aaudio))) {
         pr_err("aaudio: resume reinit: init_bs failed (%d)\n", status);
         return status;
@@ -444,7 +495,7 @@ static void aaudio_init_bs_stream_host(struct aaudio_device *a, struct aaudio_st
 
 static int aaudio_init_bs(struct aaudio_device *a)
 {
-    int i, j;
+    int i, j, num_devs;
     struct aaudio_buffer_struct_device *dev;
     struct aaudio_subdevice *sdev;
     u32 ver, sig, bs_base;
@@ -467,13 +518,15 @@ static int aaudio_init_bs(struct aaudio_device *a)
     }
     dev_info(a->dev, "aaudio: BufferStruct ver = %i\n", a->bs->version);
     dev_info(a->dev, "aaudio: Num devices = %i\n", a->bs->num_devices);
-    for (i = 0; i < a->bs->num_devices; i++) {
+    num_devs = min_t(int, a->bs->num_devices, ARRAY_SIZE(a->bs->devices));
+    for (i = 0; i < num_devs; i++) {
         dev = &a->bs->devices[i];
         dev_info(a->dev, "aaudio: Device %i %s\n", i, dev->name);
 
         sdev = aaudio_find_dev_by_uid(a, dev->name);
         if (!sdev) {
-            dev_err(a->dev, "aaudio: Subdevice not found for BufferStruct device %s\n", dev->name);
+            if (dev->name[0])
+                dev_info(a->dev, "aaudio: Subdevice not found for %s\n", dev->name);
             continue;
         }
         sdev->buf_id = (u8) i;
@@ -489,6 +542,8 @@ static int aaudio_init_bs(struct aaudio_device *a)
     list_for_each_entry(sdev, &a->subdevice_list, list) {
         if (sdev->buf_id != AAUDIO_BUFFER_ID_NONE)
             continue;
+        if (i >= ARRAY_SIZE(a->bs->devices))
+            break;
         sdev->buf_id = i;
         dev_info(a->dev, "aaudio: Created device %i %s\n", i, sdev->uid);
         strcpy(a->bs->devices[i].name, sdev->uid);

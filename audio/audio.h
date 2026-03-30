@@ -67,6 +67,9 @@ struct aaudio_stream {
     ktime_t remote_timestamp;
     snd_pcm_sframes_t frame_min;
     int started;
+
+    struct work_struct period_work;
+    struct snd_pcm_substream *substream;
 };
 struct aaudio_subdevice {
     struct aaudio_device *a;
