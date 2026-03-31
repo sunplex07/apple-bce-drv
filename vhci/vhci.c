@@ -305,9 +305,12 @@ static void bce_vhci_free_device(struct usb_hcd *hcd, struct usb_device *udev)
         if (dev->tq_mask & BIT(i)) {
             bce_vhci_transfer_queue_pause(&dev->tq[i], BCE_VHCI_PAUSE_SHUTDOWN);
             bce_vhci_cmd_endpoint_destroy(&vhci->cq, devid, (u8) i);
+            if (dev->tq[i].endp)
+                dev->tq[i].endp->hcpriv = NULL;
             bce_vhci_destroy_transfer_queue(vhci, &dev->tq[i]);
         }
     }
+    dev->tq_mask = 0;
     vhci->devices[devid] = NULL;
     vhci->port_to_device[udev->portnum] = 0;
     bce_vhci_cmd_device_destroy(&vhci->cq, devid);
@@ -331,6 +334,8 @@ static int bce_vhci_reset_device(struct bce_vhci *vhci, int index, u16 timeout)
             if (dev->tq_mask & BIT(i)) {
                 bce_vhci_transfer_queue_pause(&dev->tq[i], BCE_VHCI_PAUSE_SHUTDOWN);
                 bce_vhci_cmd_endpoint_destroy(&vhci->cq, devid, (u8) i);
+                if (dev->tq[i].endp)
+                    dev->tq[i].endp->hcpriv = NULL;
                 bce_vhci_destroy_transfer_queue(vhci, &dev->tq[i]);
             }
         }
@@ -353,6 +358,7 @@ static int bce_vhci_reset_device(struct bce_vhci *vhci, int index, u16 timeout)
                     dir = DMA_BIDIRECTIONAL;
                 bce_vhci_create_transfer_queue(vhci, &dev->tq[i], dev->tq[i].endp, devid, dir);
                 bce_vhci_cmd_endpoint_create(&vhci->cq, devid, &dev->tq[i].endp->desc);
+                dev->tq[i].endp->hcpriv = &dev->tq[i];
             }
         }
     }
@@ -491,6 +497,8 @@ static int bce_vhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_
 static int bce_vhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
 {
     struct bce_vhci_transfer_queue *q = urb->ep->hcpriv;
+    if (!q)
+        return -ENOENT;
     pr_debug("bce_vhci_urb_dequeue %x\n", urb->ep->desc.bEndpointAddress);
     return bce_vhci_urb_request_cancel(q, urb, status);
 }
@@ -541,8 +549,14 @@ static int bce_vhci_drop_endpoint(struct usb_hcd *hcd, struct usb_device *udev, 
     u8 endp_index = bce_vhci_endpoint_index(endp->desc.bEndpointAddress);
     struct bce_vhci *vhci = bce_vhci_from_hcd(hcd);
     bce_vhci_device_t devid = vhci->port_to_device[udev->portnum];
-    struct bce_vhci_transfer_queue *q = endp->hcpriv;
-    struct bce_vhci_device *vdev = vhci->devices[devid];
+    struct bce_vhci_transfer_queue *q;
+    struct bce_vhci_device *vdev;
+    if (!devid || !vhci->devices[devid]) {
+        endp->hcpriv = NULL;
+        return 0;
+    }
+    q = endp->hcpriv;
+    vdev = vhci->devices[devid];
     pr_info("bce_vhci_drop_endpoint %x:%x\n", udev->portnum, endp_index);
     if (!q) {
         if (vdev && vdev->tq_mask & BIT(endp_index)) {
@@ -556,6 +570,7 @@ static int bce_vhci_drop_endpoint(struct usb_hcd *hcd, struct usb_device *udev, 
     bce_vhci_cmd_endpoint_destroy(&vhci->cq, devid, (u8) (endp->desc.bEndpointAddress & 0x8Fu));
     vhci->devices[devid]->tq_mask &= ~BIT(endp_index);
     bce_vhci_destroy_transfer_queue(vhci, q);
+    endp->hcpriv = NULL;
     return 0;
 }
 

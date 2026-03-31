@@ -131,6 +131,8 @@ void bce_vhci_transfer_queue_event(struct bce_vhci_transfer_queue *q, struct bce
     struct bce_vhci_urb *turb;
     struct urb *urb;
     spin_lock_irqsave(&q->urb_lock, flags);
+    if (!q->active)
+        goto complete;
     bce_vhci_transfer_queue_deliver_pending(q);
 
     if (msg->cmd == BCE_VHCI_CMD_TRANSFER_REQUEST &&
