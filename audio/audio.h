@@ -68,8 +68,6 @@ struct aaudio_stream {
     snd_pcm_sframes_t frame_min;
     int started;
 
-    struct work_struct period_work;
-    struct snd_pcm_substream *substream;
 };
 struct aaudio_subdevice {
     struct aaudio_device *a;
@@ -113,6 +111,7 @@ struct aaudio_device {
     int next_alsa_id;
 
     struct completion remote_alive;
+    struct workqueue_struct *timestamp_wq;
 };
 
 void aaudio_handle_notification(struct aaudio_device *a, struct aaudio_msg *msg);
