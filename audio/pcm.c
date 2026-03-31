@@ -1,8 +1,5 @@
 #include "pcm.h"
 #include "audio.h"
-#include <linux/workqueue.h>
-
-static void aaudio_period_work(struct work_struct *work);
 
 static u64 aaudio_get_alsa_fmtbit(struct aaudio_apple_description *desc)
 {
@@ -115,8 +112,6 @@ static int aaudio_pcm_open(struct snd_pcm_substream *substream)
     struct aaudio_stream *stream = aaudio_pcm_stream(substream);
     pr_debug("aaudio_pcm_open\n");
     substream->runtime->hw = *stream->alsa_hw_desc;
-    stream->substream = substream;
-    INIT_WORK(&stream->period_work, aaudio_period_work);
     return 0;
 }
 
@@ -124,8 +119,6 @@ static int aaudio_pcm_close(struct snd_pcm_substream *substream)
 {
     struct aaudio_stream *stream = aaudio_pcm_stream(substream);
     pr_debug("aaudio_pcm_close\n");
-    cancel_work_sync(&stream->period_work);
-    stream->substream = NULL;
     return 0;
 }
 
@@ -202,7 +195,6 @@ static int aaudio_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
             break;
         case SNDRV_PCM_TRIGGER_STOP:
             stream->started = 0;
-            cancel_work_sync(&stream->period_work);
             aaudio_cmd_stop_io(sdev->a, sdev->dev_id);
             break;
         default:
@@ -285,24 +277,25 @@ int aaudio_create_pcm(struct aaudio_subdevice *sdev)
     return 0;
 }
 
-static void aaudio_period_work(struct work_struct *work)
-{
-    struct aaudio_stream *stream = container_of(work, struct aaudio_stream, period_work);
-    if (stream->substream && stream->started)
-        snd_pcm_period_elapsed(stream->substream);
-}
-
 static void aaudio_handle_stream_timestamp(struct snd_pcm_substream *substream, ktime_t timestamp)
 {
+    unsigned long flags;
     struct aaudio_stream *stream;
 
     stream = aaudio_pcm_stream(substream);
-    WRITE_ONCE(stream->remote_timestamp, timestamp);
-    if (stream->waiting_for_first_ts) {
-        WRITE_ONCE(stream->waiting_for_first_ts, false);
+    snd_pcm_stream_lock_irqsave(substream, flags);
+    if (!stream->started) {
+        snd_pcm_stream_unlock_irqrestore(substream, flags);
         return;
     }
-    schedule_work(&stream->period_work);
+    stream->remote_timestamp = timestamp;
+    if (stream->waiting_for_first_ts) {
+        stream->waiting_for_first_ts = false;
+        snd_pcm_stream_unlock_irqrestore(substream, flags);
+        return;
+    }
+    snd_pcm_stream_unlock_irqrestore(substream, flags);
+    snd_pcm_period_elapsed(substream);
 }
 
 void aaudio_handle_timestamp(struct aaudio_subdevice *sdev, ktime_t os_timestamp, u64 dev_timestamp)
@@ -311,7 +304,7 @@ void aaudio_handle_timestamp(struct aaudio_subdevice *sdev, ktime_t os_timestamp
 
     substream = sdev->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
     if (substream)
-        aaudio_handle_stream_timestamp(substream, dev_timestamp);
+        aaudio_handle_stream_timestamp(substream, os_timestamp);
     substream = sdev->pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
     if (substream)
         aaudio_handle_stream_timestamp(substream, os_timestamp);
