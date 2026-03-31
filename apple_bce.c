@@ -654,11 +654,30 @@ static DECLARE_DELAYED_WORK(bce_reinit_dwork, bce_deferred_reinit_work);
 static void bce_deferred_reinit_work(struct work_struct *work)
 {
     int status;
+    int i;
+    u16 vid = 0;
 
     if (!global_bce)
         return;
 
-    pr_info("apple-bce: deferred reinit: starting (200ms after resume)\n");
+    pr_info("apple-bce: deferred reinit: starting\n");
+
+    /* Wait for T2 PCIe link to re-train after S3.
+     * MMIO to T2 BARs will hang the CPU if the link is down.
+     * Config space reads go through the root port and return 0xFFFF safely.
+     * Poll aggressively first (link usually retrains in ~50-200ms),
+     * then back off to 50ms intervals. */
+    for (i = 0; i < 120; i++) {
+        pci_read_config_word(global_bce->pci, PCI_VENDOR_ID, &vid);
+        if (vid == PCI_VENDOR_ID_APPLE)
+            break;
+        msleep(i < 40 ? 5 : 50);
+    }
+    if (vid != PCI_VENDOR_ID_APPLE) {
+        pr_err("apple-bce: deferred reinit: T2 not accessible after timeout (vid=0x%04x)\n", vid);
+        return;
+    }
+    pr_info("apple-bce: deferred reinit: T2 link ready after %d polls\n", i + 1);
     status = apple_bce_hard_reinit(global_bce);
     if (status)
         pr_err("apple-bce: deferred reinit: FAILED (%d)\n", status);
@@ -695,8 +714,8 @@ static int apple_bce_resume(struct device *dev)
     /* Schedule reinit 200ms after resume completes — late enough that
      * all PCI devices are restored and the T2 PCIe endpoint is ready,
      * but fast enough the user barely notices. */
-    pr_info("apple-bce: resume: scheduling deferred reinit (200ms)\n");
-    schedule_delayed_work(&bce_reinit_dwork, msecs_to_jiffies(200));
+    pr_info("apple-bce: resume: scheduling deferred reinit\n");
+    schedule_delayed_work(&bce_reinit_dwork, 0);
     return 0;
 }
 
